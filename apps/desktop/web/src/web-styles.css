@@ -1,5 +1,0 @@
-@import '@desktop/styles.css';
-
-/* The desktop sources live outside this web wrapper's project root. */
-@source '/home/elshad/.hermes/hermes-agent/apps/desktop/src';
-@source '/home/elshad/workspace/projects/hermes-web/src';
