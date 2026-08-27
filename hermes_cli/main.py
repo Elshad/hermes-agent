@@ -472,6 +472,7 @@ from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
+from hermes_cli.subcommands.desktop_web import build_desktop_web_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
@@ -8535,288 +8536,6 @@ def cmd_gui(args: argparse.Namespace):
     sys.exit(launch_result.returncode)
 
 
-def cmd_gui_web(args: argparse.Namespace):
-    """Build and launch the desktop WEB."""
-    desktop_dir = PROJECT_ROOT / "apps" / "desktop" / "web"
-    if not (desktop_dir / "package.json").exists():
-        print(f"Desktop WEB source not found at: {desktop_dir}")
-        sys.exit(1)
-
-    try:
-        from hermes_logging import setup_logging as _setup_logging_gui
-        _setup_logging_gui(mode="gui")
-    except Exception:
-        pass
-
-    from hermes_constants import with_hermes_node_path
-
-    # with_hermes_node_path() copies os.environ when called with no arg.
-    env = with_hermes_node_path()
-    if getattr(args, "fake_boot", False):
-        env["HERMES_DESKTOP_BOOT_FAKE"] = "1"
-    if getattr(args, "ignore_existing", False):
-        env["HERMES_DESKTOP_IGNORE_EXISTING"] = "1"
-    if getattr(args, "hermes_root", None):
-        env["HERMES_DESKTOP_HERMES_ROOT"] = str(Path(args.hermes_root).expanduser().resolve())
-    if getattr(args, "cwd", None):
-        env["HERMES_DESKTOP_CWD"] = str(Path(args.cwd).expanduser().resolve())
-    else:
-        env["HERMES_DESKTOP_CWD"] = os.getcwd()
-
-    # Desktop launch options from config.yaml (`desktop.electron_flags`,
-    # `desktop.disable_gpu`, `desktop.ozone_platform_hint`). The GPU policy
-    # and ozone hint are bridged to env vars the Electron/Chromium process
-    # already reads; an explicit env var still wins over config so
-    # `HERMES_DESKTOP_DISABLE_GPU=... hermes desktop` and
-    # `ELECTRON_OZONE_PLATFORM_HINT=... hermes desktop` keep working.
-    config_electron_flags, config_disable_gpu, config_password_store, config_ozone_hint = (
-        _desktop_launch_options()
-    )
-    if config_disable_gpu != "auto" and "HERMES_DESKTOP_DISABLE_GPU" not in os.environ:
-        env["HERMES_DESKTOP_DISABLE_GPU"] = config_disable_gpu
-    if config_ozone_hint != "auto" and "ELECTRON_OZONE_PLATFORM_HINT" not in os.environ:
-        env["ELECTRON_OZONE_PLATFORM_HINT"] = config_ozone_hint
-
-    # Linux keychain backend for safeStorage (`desktop.password_store`).
-    # Chromium needs the --password-store switch to pick the right keychain;
-    # without it safeStorage.isEncryptionAvailable() is often false and the
-    # desktop app refuses to persist remote gateway tokens. Config wins over
-    # detection; an explicit env var wins over both so
-    # `HERMES_DESKTOP_PASSWORD_STORE=... hermes desktop` keeps working.
-    if sys.platform == "linux" and "HERMES_DESKTOP_PASSWORD_STORE" not in os.environ:
-        password_store = (
-            config_password_store
-            if config_password_store != "auto"
-            else _detect_linux_password_store()
-        )
-        if password_store:
-            env["HERMES_DESKTOP_PASSWORD_STORE"] = password_store
-
-    source_mode = getattr(args, "source", False)
-    skip_build = getattr(args, "skip_build", False)
-    force_build = getattr(args, "force_build", False)
-
-    # macOS-only one-shot: create a self-signed code-signing identity so TCC
-    # grants survive rebuilds, then exit without building/launching.
-    if getattr(args, "setup_tcc_identity", False):
-        identity = getattr(args, "identity", None) or "Hermes Local Signing"
-        ok = _desktop_macos_setup_tcc_identity(identity)
-        sys.exit(0 if ok else 1)
-
-    packaged_executable = _desktop_packaged_executable(desktop_dir)
-
-    if source_mode or not skip_build:
-        npm = _resolve_node_runtime_npm()
-        if not npm:
-            print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
-            print("Install Node.js, then run:  hermes gui")
-            sys.exit(1)
-    else:
-        npm = None
-
-    if skip_build:
-        if source_mode:
-            if not _desktop_dist_exists(desktop_dir):
-                print(f"✗ --skip-build --source was passed but no desktop dist found at: {desktop_dir / 'dist'}")
-                print("  Pre-build first:  cd apps/desktop && npm run build")
-                print("  Or drop --skip-build to install dependencies and build automatically.")
-                sys.exit(1)
-            if not (_electron_dir(PROJECT_ROOT) / "package.json").exists():
-                print("✗ --skip-build --source requires existing desktop workspace dependencies.")
-                print(f"  Install first:  cd {PROJECT_ROOT} && npm ci")
-                print("  Or drop --skip-build to install dependencies and build automatically.")
-                sys.exit(1)
-            print(f"→ Skipping desktop source build (--skip-build --source); using dist at {desktop_dir / 'dist'}")
-        elif packaged_executable is None:
-            print(f"✗ --skip-build was passed but no packaged desktop app was found at: {desktop_dir / 'release'}")
-            print("  Pre-build first:  cd apps/desktop && npm run pack")
-            print("  Or drop --skip-build to package automatically.")
-            sys.exit(1)
-        else:
-            print(f"→ Skipping desktop package build (--skip-build); using {packaged_executable}")
-    else:
-        # Check the content-hash stamp before doing any build work.
-        # If the source tree hasn't changed since the last successful build,
-        # skip the npm install + build entirely (saves a ton of useless work).
-        # --force-build overrides the stamp and always rebuilds.
-        build_needed = force_build or _desktop_build_needed(
-            desktop_dir, PROJECT_ROOT, source_mode=source_mode
-        )
-        if not build_needed:
-            build_label = "source build" if source_mode else "packaged app"
-            print(f"✓ Desktop {build_label} is up to date (content stamp matches)")
-        else:
-            print("→ Installing desktop workspace dependencies...")
-            # Put the Hermes-managed Node on PATH so npm's child scripts (which
-            # shell out to bare `node`, e.g. electron-winstaller's
-            # select-7z-arch.js) resolve it even when the parent PATH is
-            # stripped — the desktop updater chain (Desktop → hermes-setup →
-            # hermes update) loses shell PATH customizations. Wrapping the
-            # NixOS build env keeps its PYTHON hint while restoring managed Node
-            # ahead of a bare PATH (same idiom as the `hermes update` path).
-            nixos_env = with_hermes_node_path(_nixos_build_env())
-            install_result = _run_npm_install_deterministic(npm, PROJECT_ROOT, capture_output=False, env=nixos_env)
-            if install_result.returncode != 0:
-                if not _electron_pkg_staged_missing_dist(PROJECT_ROOT):
-                    print("✗ Desktop dependency install failed")
-                    print(f"  Run manually:  cd {PROJECT_ROOT} && npm ci")
-                    sys.exit(install_result.returncode or 1)
-                repaired = _try_redownload_electron_dist(PROJECT_ROOT, env)
-                if repaired:
-                    print("  ⚠ Dependency install failed with a missing Electron dist; "
-                          "repopulated it and continuing.")
-                else:
-                    print("  ⚠ Dependency install failed with a missing Electron dist; "
-                          "continuing to the build so electron-builder can attempt "
-                          "the Electron fetch itself.")
-
-            build_label = "source build" if source_mode else "packaged app"
-            print(f"→ Building desktop {build_label}...")
-            build_script = "build" if source_mode else "pack"
-            if _force_adhoc_macos_signing(env, source_mode=source_mode):
-                print("  → No Developer ID configured; ad-hoc signing this local rebuild "
-                      "(CSC_IDENTITY_AUTO_DISCOVERY=false)")
-            npm_build_env = _npm_lifecycle_env(env)
-            if not source_mode:
-                # A running desktop instance launched from release/win-unpacked
-                # holds Hermes.exe locked on Windows, so the pack can't replace
-                # it ("Access is denied" / ERR_ELECTRON_BUILDER_CANNOT_EXECUTE).
-                # Stop it first so the rebuild — including the installer's
-                # headless --update rebuild — succeeds instead of failing cryptically.
-                stopped = _stop_desktop_processes_locking_build(desktop_dir)
-                if stopped:
-                    print(f"  ⚠ Stopped running desktop app to free the build output (pid {', '.join(map(str, stopped))})")
-            build_result = subprocess.run(
-                [npm, "run", build_script], cwd=desktop_dir, env=npm_build_env, check=False
-            )
-            if (
-                build_result.returncode != 0
-                and not source_mode
-                and _desktop_packaged_executable(desktop_dir) is None
-            ):
-                # Corrupt cached Electron zip → partial unpack → ENOENT on rename.
-                # stdlib zipfile won't catch the common concat-junk case, so purge
-                # and retry once; @electron/get SHASUM is the real gate.
-                #
-                # Gate on a MISSING packaged executable: that is the signature of
-                # the corrupt-download class this recovery exists for. A late
-                # failure such as macOS code signing leaves the executable in
-                # place — redownloading Electron can't repair it, so the purge +
-                # retry would only add another slow, identical failure (#40187).
-                purged: list[Path] = []
-                restored = False
-                if not _electron_dist_ok(PROJECT_ROOT):
-                    purged = _purge_electron_build_cache(desktop_dir)
-                    restored = _redownload_electron_dist(PROJECT_ROOT, env)
-                if restored:
-                    print("  ⚠ Desktop build failed; refreshed the Electron download and retrying once...")
-                    for p in purged:
-                        print(f"    - {p}")
-                    # The purge can't remove a win-unpacked tree whose Hermes.exe
-                    # is still locked by a running instance; stop it before retry.
-                    _stop_desktop_processes_locking_build(desktop_dir)
-                    build_result = subprocess.run(
-                        [npm, "run", build_script], cwd=desktop_dir, env=npm_build_env, check=False
-                    )
-            if (
-                build_result.returncode != 0
-                and not source_mode
-                and not env.get("ELECTRON_MIRROR")
-                and _desktop_packaged_executable(desktop_dir) is None
-            ):
-                print("  ⚠ Desktop build still failing; the Electron download from "
-                      "GitHub looks blocked. Re-downloading via a public mirror "
-                      "(npmmirror.com)... (set ELECTRON_MIRROR to use another mirror)")
-                mirror = _ELECTRON_FALLBACK_MIRROR
-                mirror_env = dict(npm_build_env)
-                mirror_env["ELECTRON_MIRROR"] = mirror
-                if not _electron_dist_ok(PROJECT_ROOT):
-                    _redownload_electron_dist(PROJECT_ROOT, env, mirror=mirror)
-                _stop_desktop_processes_locking_build(desktop_dir)
-                build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=mirror_env, check=False)
-            if build_result.returncode != 0:
-                print("✗ Desktop GUI build failed")
-                print(f"  Run manually:  cd apps/desktop && npm run {build_script}")
-                if sys.platform == "win32":
-                    print("  If this says \"Access is denied\" on Hermes.exe, close any")
-                    print("  running Hermes desktop window and retry.")
-                print("  If the log shows Electron download retries, rebuild via a mirror:")
-                print("    ELECTRON_MIRROR=<mirror-base-url> hermes desktop --force-build")
-                sys.exit(build_result.returncode or 1)
-            packaged_executable = _desktop_packaged_executable(desktop_dir)
-            if not source_mode:
-                # Locally-built apps are ad-hoc signed; make them relaunchable after
-                # an in-place self-update (otherwise macOS reports "Hermes is
-                # damaged"). No-op on non-macOS and on real-identity builds.
-                _desktop_macos_relaunchable_fixup(desktop_dir)
-
-                # Windows integrity gate (#69179): never declare the rebuild a
-                # success on a Hermes.exe Windows cannot load (truncated PE from
-                # a corrupt cached Electron zip, wrong-arch tree, interrupted
-                # rcedit rewrite). Roll back to the .bak tree preserved by
-                # before-pack.mjs when possible, then fail loudly so the
-                # updater's retry-once rebuilds from a fresh Electron download
-                # instead of silently shipping the broken exe.
-                verified_executable, rolled_back = _ensure_desktop_exe_launchable(
-                    desktop_dir, packaged_executable
-                )
-                if packaged_executable is not None and (
-                    rolled_back or verified_executable is None
-                ):
-                    sys.exit(1)
-                packaged_executable = verified_executable
-
-            # Build succeeded — write the stamp so next run can skip
-            _write_desktop_build_stamp(PROJECT_ROOT, source_mode=source_mode)
-
-    # Linux: register the app in the desktop launcher, so Hermes shows up
-    # in the application menu with its icon. Best-effort and idempotent.
-    # A failure must never stop the app from launching.
-    _register_linux_desktop_entry()
-
-    # --build-only: produce the artifact but do NOT launch. The installer's
-    # --update flow drives the rebuild headlessly and then launches the desktop
-    # itself (detached, after the old exe has exited), so the launch must NOT
-    # happen here — it would block the installer and, on Windows, the old exe
-    # is still being replaced. Verify the expected artifact exists so a silent
-    # "built nothing" can't slip past, then return success.
-    if getattr(args, "build_only", False):
-        if source_mode:
-            if not _desktop_dist_exists(desktop_dir):
-                print(f"✗ --build-only --source produced no dist at: {desktop_dir / 'dist'}")
-                sys.exit(1)
-            print(f"✓ Desktop source build ready at {desktop_dir / 'dist'} (not launching; --build-only)")
-        elif packaged_executable is None:
-            print(f"✗ --build-only produced no launchable app at: {desktop_dir / 'release'}")
-            print("  Expected an unpacked Electron app for the current OS.")
-            sys.exit(1)
-        else:
-            print(f"✓ Desktop packaged app ready: {packaged_executable} (not launching; --build-only)")
-        return
-
-    if source_mode:
-        print("→ Launching Hermes Desktop from source build...")
-        launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env, check=False)
-        sys.exit(launch_result.returncode)
-
-    if packaged_executable is None:
-        print(f"✗ Desktop package build completed but no launchable app was found at: {desktop_dir / 'release'}")
-        print("  Expected an unpacked Electron app for the current OS.")
-        sys.exit(1)
-
-    launch_command = [str(packaged_executable)]
-    if not _desktop_linux_sandbox_fixup(packaged_executable):
-        if _desktop_linux_needs_no_sandbox() and _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
-            print("⚠ Falling back to --no-sandbox because this Linux host restricts unprivileged user namespaces and the Electron sandbox helper could not be configured.")
-            launch_command.append("--no-sandbox")
-        else:
-            sys.exit(1)
-
-    launch_command.extend(config_electron_flags)
-    print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
-    launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)
-    sys.exit(launch_result.returncode)
-
 
 # Dashboard process-hygiene helpers live in hermes_cli/dashboard_procs.py
 # (main.py decomposition, mechanical move). Re-exported lazily through the
@@ -12212,6 +11931,136 @@ def _is_electron_packaged_web_dist(path: str) -> bool:
     return "app.asar" in path.replace("\\", "/")
 
 
+def _desktop_web_processes() -> list[tuple[int, str]]:
+    """Return processes launched through the canonical desktop-web command."""
+    try:
+        import psutil
+    except Exception:
+        return []
+
+    result = []
+    current = os.getpid()
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if process.info["pid"] == current:
+                continue
+            argv = process.info.get("cmdline") or []
+            command = " ".join(argv)
+            if "-m" in argv and "hermes_cli.main" in argv and "desktop-web" in argv:
+                result.append((process.info["pid"], command))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return result
+
+
+def _stop_desktop_web_processes() -> bool:
+    processes = _desktop_web_processes()
+    if not processes:
+        print("No hermes desktop-web processes running.")
+        return True
+
+    import signal
+    import time
+
+    for pid, _command in processes:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _desktop_web_processes():
+        time.sleep(0.1)
+
+    remaining = _desktop_web_processes()
+    for pid, _command in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return not _desktop_web_processes()
+
+
+def cmd_desktop_web(args):
+    """Build and serve the Desktop renderer through the Dashboard server."""
+    web_dir = PROJECT_ROOT / "apps" / "desktop" / "web"
+    dist_dir = web_dir / "dist"
+    if not (web_dir / "package.json").exists():
+        print(f"Desktop Web source not found at: {web_dir}", file=sys.stderr)
+        return 1
+
+    if args.status:
+        processes = _desktop_web_processes()
+        if not processes:
+            print("No hermes desktop-web processes running.")
+        else:
+            for pid, command in processes:
+                print(f"{pid}: {command}")
+        return 0
+
+    if args.stop:
+        return 0 if _stop_desktop_web_processes() else 1
+
+    if args.port < 0 or args.port > 65535:
+        print("desktop-web port must be between 0 and 65535", file=sys.stderr)
+        return 2
+
+    env = os.environ.copy()
+    env["HERMES_WEB_DIST"] = str(dist_dir.resolve())
+    env.pop("HERMES_SERVE_HEADLESS", None)
+
+    if args.skip_build:
+        if not (dist_dir / "index.html").exists():
+            print(f"✗ --skip-build was passed but no web dist found at: {dist_dir}", file=sys.stderr)
+            print("  Run: npm run build --workspace apps/desktop/web", file=sys.stderr)
+            return 1
+        print(f"→ Skipping Desktop Web build; using {dist_dir}")
+    else:
+        npm = _resolve_node_runtime_npm()
+        if not npm:
+            print("Desktop Web requires Node.js/npm, but npm was not found on PATH.", file=sys.stderr)
+            return 1
+        from hermes_constants import with_hermes_node_path
+        npm_env = _npm_lifecycle_env(with_hermes_node_path(env))
+        print("→ Installing Desktop Web workspace dependencies...")
+        install = subprocess.run(
+            [npm, "install", "--workspace", "apps/desktop/web"],
+            cwd=PROJECT_ROOT,
+            env=npm_env,
+            check=False,
+        )
+        if install.returncode != 0:
+            print("✗ Desktop Web dependency install failed", file=sys.stderr)
+            return install.returncode or 1
+        print("→ Building Desktop Web renderer...")
+        build = subprocess.run(
+            [npm, "run", "build", "--workspace", "apps/desktop/web"],
+            cwd=PROJECT_ROOT,
+            env=npm_env,
+            check=False,
+        )
+        if build.returncode != 0 or not (dist_dir / "index.html").exists():
+            print("✗ Desktop Web build failed or produced no dist/index.html", file=sys.stderr)
+            return build.returncode or 1
+
+    os.environ.update(env)
+    dashboard_args = argparse.Namespace(
+        host=args.host,
+        port=args.port,
+        no_open=args.no_open,
+        skip_build=True,
+        status=False,
+        stop=False,
+        insecure=False,
+        isolated=True,
+        open_profile="",
+        headless_backend=False,
+        ssh_session_token_file=None,
+        ssh_owner_nonce=None,
+    )
+    return cmd_dashboard(dashboard_args)
+
+
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     _token_file = getattr(args, "ssh_session_token_file", None)
@@ -14817,6 +14666,7 @@ def main():
         cmd_dashboard=cmd_dashboard,
         cmd_dashboard_register=cmd_dashboard_register,
     )
+    build_desktop_web_parser(subparsers, cmd_desktop_web=cmd_desktop_web)
 
 
     # =========================================================================

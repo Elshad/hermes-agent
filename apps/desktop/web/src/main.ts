@@ -1,5 +1,4 @@
-import './web-styles.css'
-import { installWebHermesDesktop } from './web-hermes-desktop'
+import { installWebHermesDesktop } from './preload'
 
 installWebHermesDesktop()
 void import('@desktop/main')

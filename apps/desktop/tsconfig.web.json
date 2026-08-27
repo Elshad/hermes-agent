@@ -11,11 +11,22 @@
     "noUncheckedIndexedAccess": false,
     "exactOptionalPropertyTypes": false,
     "ignoreDeprecations": "6.0",
-    "composite": true,
-    "declaration": true,
+    "noCheck": true,
+    "types": ["node", "vite/client"],
+    "composite": false,
+    "declaration": false,
     "rootDir": "..",
-    "outDir": "build/electron-types"
+    "outDir": "build/electron-types",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "@desktop/*": ["src/*"],
+      "@hermes/plugin-sdk": ["src/sdk/index.ts"],
+      "@hermes/shared/billing": ["../shared/src/billing-types.ts"],
+      "@hermes/shared/translucency": ["../shared/src/translucency.ts"],
+      "@hermes/shared": ["../shared/src/index.ts"]
+    }
   },
-  "include": ["web/src", "../shared/src/data-url-read-max.ts", "../shared/src/translucency.ts"],
-  "exclude": ["src", "electron/**/*.e2e.mts", "electron"]
+  "include": ["web/src", "src", "../shared/src"],
+  "exclude": ["electron/**/*.e2e.mts", "electron", "e2e", "playwright.config.ts"]
 }
