@@ -620,7 +620,7 @@ function proxyWebSocket(request, socket, head, target) {
     const incoming = new URL(request.url || '/', `http://${host}:${port}`)
     const lines = [`${request.method || 'GET'} ${targetRequestPath(target, incoming, true)} HTTP/1.1`]
     for (const [name, value] of Object.entries(request.headers)) {
-      if (['host', 'origin', 'connection', 'content-length', 'cookie', 'authorization', 'x-hermes-session-token'].includes(name.toLowerCase())) continue
+      if (['host', 'origin', 'connection', 'upgrade', 'content-length', 'cookie', 'authorization', 'x-hermes-session-token'].includes(name.toLowerCase())) continue
       lines.push(`${name}: ${value}`)
     }
     if (isOwnedBackendTarget(target)) lines.push(`x-hermes-session-token: ${process.env.HERMES_DESKTOP_WEB_BACKEND_TOKEN || ''}`)

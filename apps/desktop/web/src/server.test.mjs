@@ -1,10 +1,11 @@
 import { once } from 'node:events'
 import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { createServer, request as nodeRequest } from 'node:http'
+import { connect as netConnect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
-import { randomBytes, scryptSync } from 'node:crypto'
+import { createHash, randomBytes, scryptSync } from 'node:crypto'
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
@@ -57,6 +58,37 @@ function request(path, options = {}) {
   })
 }
 
+function websocketRequest(path) {
+  return new Promise((resolve, reject) => {
+    const key = randomBytes(16).toString('base64')
+    const socket = netConnect(desktopActualPort, '127.0.0.1')
+    let response = ''
+    socket.setTimeout(5_000)
+    socket.once('connect', () => {
+      socket.write([
+        `GET ${path} HTTP/1.1`,
+        `Host: 127.0.0.1:${desktopActualPort}`,
+        'Origin: http://127.0.0.1:' + desktopActualPort,
+        'Connection: Upgrade',
+        'Upgrade: websocket',
+        `Sec-WebSocket-Key: ${key}`,
+        'Sec-WebSocket-Version: 13',
+        '',
+        ''
+      ].join('\r\n'))
+    })
+    socket.on('data', chunk => {
+      response += chunk.toString()
+      if (response.includes('\r\n\r\n')) {
+        socket.destroy()
+        resolve(response)
+      }
+    })
+    socket.once('timeout', () => reject(new Error('WebSocket handshake timed out.')))
+    socket.once('error', reject)
+  })
+}
+
 describe('Desktop Web host authentication and backend isolation', () => {
   beforeAll(async () => {
     hermesHome = await mkdtemp(join(tmpdir(), 'hermes-desktop-web-test-'))
@@ -74,6 +106,22 @@ describe('Desktop Web host authentication and backend isolation', () => {
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: true, path: req.url }))
       })
+    })
+    backend.on('upgrade', (req, socket) => {
+      backendRequests.push({
+        path: req.url,
+        token: req.headers['x-hermes-session-token'] || '',
+        upgrade: req.headers.upgrade || '',
+        connection: req.headers.connection || ''
+      })
+      if (req.headers.upgrade !== 'websocket' || req.headers.connection !== 'Upgrade') {
+        socket.end('HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n')
+        return
+      }
+      const accept = createHash('sha1')
+        .update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+        .digest('base64')
+      socket.end(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
     })
     backend.listen(0, '127.0.0.1')
     await once(backend, 'listening')
@@ -161,5 +209,13 @@ describe('Desktop Web host authentication and backend isolation', () => {
       headers: { Host: 'desktop.example.test', Cookie: 'hermes_desktop_web_session=forged' }
     })
     expect(forged.status).toBe(401)
+  })
+
+  it('forwards WebSocket upgrades without duplicating upgrade headers', async () => {
+    const response = await websocketRequest('/api/ws')
+    expect(response).toMatch(/^HTTP\/1\.1 101 Switching Protocols/)
+    const forwarded = backendRequests.at(-1)
+    expect(forwarded).toMatchObject({ token: backendToken, upgrade: 'websocket', connection: 'Upgrade' })
+    expect(forwarded.path).toBe(`/api/ws?token=${backendToken}`)
   })
 })
