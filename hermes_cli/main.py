@@ -11826,6 +11826,133 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     print()
 
 
+def _maybe_setup_desktop_web_auth_interactively(args) -> None:
+    """Offer Dashboard-style first-run password setup for Desktop Web.
+
+    Desktop Web has its own host-level gate because its backend is a private,
+    launcher-owned child and must not borrow Dashboard sessions.  Keep the
+    first-run experience familiar, though: when a public authority or a
+    non-loopback bind means the gate will engage, an interactive operator can
+    configure the bundled username/password provider before the Node host
+    starts.  Non-TTY launches deliberately fall through to the Node host's
+    fail-closed response.
+    """
+    host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
+    loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+
+    try:
+        from urllib.parse import urlparse
+
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        desktop_web = config.get("desktop_web")
+        if not isinstance(desktop_web, dict):
+            desktop_web = {}
+        basic_auth = desktop_web.get("basic_auth")
+        if not isinstance(basic_auth, dict):
+            basic_auth = {}
+
+        configured_public_url = (
+            os.environ.get("HERMES_DESKTOP_WEB_PUBLIC_URL", "").strip()
+            or str(desktop_web.get("public_url", "") or "").strip()
+        )
+        public_hostname = ""
+        if configured_public_url:
+            parsed = urlparse(configured_public_url)
+            if parsed.scheme in {"http", "https"}:
+                public_hostname = (parsed.hostname or "").lower()
+
+        auth_required = host.strip("[]").lower() not in loopback_hosts
+        auth_required = auth_required or (
+            public_hostname and public_hostname not in loopback_hosts
+        )
+        if not auth_required:
+            return
+
+        env_username = os.environ.get("HERMES_DESKTOP_WEB_BASIC_AUTH_USERNAME", "").strip()
+        env_password = os.environ.get("HERMES_DESKTOP_WEB_BASIC_AUTH_PASSWORD", "").strip()
+        env_hash = os.environ.get("HERMES_DESKTOP_WEB_BASIC_AUTH_PASSWORD_HASH", "").strip()
+        username = env_username or str(basic_auth.get("username", "") or "").strip()
+        has_password = bool(
+            env_password
+            or env_hash
+            or str(basic_auth.get("password_hash", "") or "").strip()
+            or str(basic_auth.get("password", "") or "").strip()
+        )
+        if username and has_password:
+            return
+    except Exception:
+        # Do not make startup less safe when config discovery fails.  The Node
+        # host remains the final fail-closed authority.
+        return
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+
+    print()
+    print(f"⚠ Desktop Web authentication is required for this configuration ({host}).")
+    print(
+        "  A public URL or non-loopback bind requires a username and password."
+    )
+    print()
+    print("  Configure Desktop Web username/password now?")
+    print("    [1] Username & password (recommended)")
+    print("    [2] Cancel")
+    print()
+
+    try:
+        choice = input("  Choice [1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        sys.exit(1)
+    if choice != "1":
+        print("  Cancelled.")
+        sys.exit(1)
+
+    import getpass
+
+    print()
+    try:
+        username = line_input("  Username [admin]: ").strip() or "admin"
+        password = getpass.getpass("  Password: ")
+        confirm = getpass.getpass("  Confirm password: ")
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        sys.exit(1)
+
+    if not password:
+        print("  ✗ Empty password — aborting.")
+        sys.exit(1)
+    if password != confirm:
+        print("  ✗ Passwords don't match — aborting.")
+        sys.exit(1)
+
+    try:
+        from plugins.dashboard_auth.basic import hash_password
+
+        password_hash = hash_password(password)
+        basic_auth["username"] = username
+        basic_auth["password_hash"] = password_hash
+        # Never persist plaintext, even though the server supports it as a
+        # compatibility fallback for manually managed configurations.
+        basic_auth["password"] = ""
+        if not str(basic_auth.get("secret", "") or "").strip():
+            basic_auth["secret"] = secrets.token_urlsafe(32)
+        desktop_web["basic_auth"] = basic_auth
+        config["desktop_web"] = desktop_web
+        save_config(config)
+    except Exception as exc:
+        print(f"  ✗ Failed to configure Desktop Web authentication: {exc}")
+        sys.exit(1)
+
+    print()
+    print(f"  ✓ Username/password auth configured (user: {username}).")
+    print("    Saved to config.yaml under desktop_web.basic_auth.")
+    print("    Start Desktop Web again if this process was not launched interactively.")
+    print()
+
+
 def _read_ssh_session_token_file(path: str) -> str:
     """Read and unlink a Desktop SSH token from its private runtime directory."""
     if sys.platform == "win32":
@@ -12055,6 +12182,11 @@ def cmd_desktop_web(args):
         if build.returncode != 0 or not (dist_dir / "index.html").exists():
             print("✗ Desktop Web build failed or produced no dist/index.html", file=sys.stderr)
             return build.returncode or 1
+
+    # Match Dashboard's first-run behavior: interactive operators can create
+    # the independent Desktop Web gate before the host starts. Background and
+    # service launches remain fail-closed in server.mjs when it is unconfigured.
+    _maybe_setup_desktop_web_auth_interactively(args)
 
     node = shutil.which("node")
     if not node:

@@ -175,7 +175,14 @@ desktop_web:
 
 `password_hash` is preferred and uses the same scrypt format as Dashboard’s
 bundled basic provider. `password` is supported as a fallback and is hashed in
-memory at startup. For secrets, environment variables override config values:
+memory at startup. On the first interactive launch, when `public_url` or a
+non-loopback bind engages the gate and no credentials are configured,
+`hermes desktop-web` offers to collect the username and password, writes a
+scrypt `password_hash` and signing `secret` to `config.yaml`, and then starts
+normally. This onboarding is intentionally skipped for non-interactive
+services and background launches; those fail closed instead of creating
+credentials without an operator present. For secrets, environment variables
+override config values:
 
 ```text
 HERMES_DESKTOP_WEB_BASIC_AUTH_USERNAME
