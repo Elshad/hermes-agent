@@ -46,6 +46,20 @@ function webConnectionPolicy() {
   }
 }
 
+function webTailwindSource() {
+  return {
+    name: 'hermes-web-tailwind-source',
+    enforce: 'pre' as const,
+    transform(code: string, id: string) {
+      if (id.split('?')[0] !== resolve(desktopSrc, 'styles.css')) return null
+      return {
+        code: `@source "${desktopSrc.replaceAll('\\', '/')}";\n${code}`,
+        map: null
+      }
+    }
+  }
+}
+
 function upstreamFonts() {
   return {
     name: 'hermes-upstream-fonts',
@@ -76,7 +90,7 @@ function compilerPreset() {
 export default defineConfig(({ command }) => ({
   base: '/',
   publicDir: resolve(desktopRoot, 'public'),
-  plugins: [webConnectionPolicy(), react(), babel({ presets: [compilerPreset()] }), tailwindcss(), upstreamFonts()],
+  plugins: [webConnectionPolicy(), webTailwindSource(), react(), babel({ presets: [compilerPreset()] }), tailwindcss(), upstreamFonts()],
   css: { postcss: { plugins: [] } },
   optimizeDeps: {
     exclude: [
