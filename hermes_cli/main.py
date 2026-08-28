@@ -434,6 +434,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -12068,6 +12069,10 @@ def cmd_desktop_web(args):
     backend_env.pop("HERMES_DESKTOP_WEB_PUBLIC_URL", None)
     backend_env.pop("HERMES_WEB_DIST", None)
     backend_env["HERMES_DESKTOP_WEB_CHILD"] = "1"
+    # Keep the native Desktop backend contract: this credential is generated
+    # for this child only and is never exposed to the browser-facing renderer.
+    backend_token = secrets.token_hex(32)
+    backend_env["HERMES_DASHBOARD_SESSION_TOKEN"] = backend_token
     backend_command = [
         sys.executable, "-m", "hermes_cli.main", "serve",
         "--host", "127.0.0.1", "--port", "0", "--no-open", "--isolated",
@@ -12115,8 +12120,12 @@ def cmd_desktop_web(args):
             "--port", str(args.port),
             "--backend-url", f"http://127.0.0.1:{backend_port}",
         ]
+        web_env = env.copy()
+        # The Node host needs the token to authenticate only its owned backend
+        # proxy. It remains process-local and is never included in page data.
+        web_env["HERMES_DESKTOP_WEB_BACKEND_TOKEN"] = backend_token
         print(f"→ Starting standalone Desktop Web on {args.host}:{args.port}")
-        web = subprocess.Popen(command, cwd=web_dir, env=env)
+        web = subprocess.Popen(command, cwd=web_dir, env=web_env)
         try:
             if not args.no_open:
                 deadline = time.monotonic() + 15

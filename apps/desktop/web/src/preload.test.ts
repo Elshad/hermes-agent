@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest'
 
-import { parseApiResponse } from './preload'
+import { connection, isLocalConnection, parseApiResponse } from './preload'
 
 describe('Desktop Web preload transport', () => {
+  it('keeps the owned local connection on native token auth', () => {
+    expect(isLocalConnection()).toBe(true)
+    expect(isLocalConnection('local')).toBe(true)
+    expect(isLocalConnection('remote-1')).toBe(false)
+    expect(connection('default', 'local')).toMatchObject({ authMode: 'token', mode: 'local', token: '' })
+    expect(connection('default', 'remote-1')).toMatchObject({ authMode: 'oauth', mode: 'remote' })
+  })
+
   it('parses JSON success responses', async () => {
     const result = await parseApiResponse<{ ok: boolean }>(
       new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })

@@ -148,7 +148,17 @@ function wsOrigin() {
   return `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
 }
 
+export function isLocalConnection(connectionId?: null | string) {
+  const scoped = connectionId?.trim() || ''
+  return !scoped || scoped === 'local'
+}
+
 async function gatewayWsUrl(profile?: null | string, connectionId?: null | string) {
+  if (isLocalConnection(connectionId)) {
+    const url = new URL(`${wsOrigin()}/api/ws`)
+    if (profile?.trim()) url.searchParams.set('profile', profile.trim())
+    return { ok: true as const, wsUrl: url.toString() }
+  }
   try {
     const { ticket } = await requestJson<{ ticket: string }>({
       path: '/api/auth/ws-ticket',
@@ -171,24 +181,25 @@ async function gatewayWsUrl(profile?: null | string, connectionId?: null | strin
   }
 }
 
-function connection(profile?: null | string, connectionId = ''): HermesConnection {
+export function connection(profile?: null | string, connectionId = ''): HermesConnection {
   const selected = profile?.trim() || undefined
   const scoped = connectionId?.trim() || ''
+  const local = isLocalConnection(scoped)
   const wsUrl = new URL(`${wsOrigin()}/api/ws`)
   if (scoped) wsUrl.searchParams.set('connectionId', scoped)
   if (selected) wsUrl.searchParams.set('profile', selected)
   return {
-    authMode: 'oauth',
+    authMode: local ? 'token' : 'oauth',
     baseUrl: window.location.origin,
     connectionId: scoped,
     isFullscreen: false,
     logs: [],
-    mode: 'remote',
+    mode: local ? 'local' : 'remote',
     nativeOverlayWidth: 0,
     profile: selected,
     remoteHost: window.location.host,
-    remoteIdentity: scoped || 'unconfigured',
-    remoteKind: 'url',
+    remoteIdentity: scoped || 'local',
+    remoteKind: local ? 'local' : 'url',
     source: 'settings',
     token: '',
     windowButtonPosition: null,

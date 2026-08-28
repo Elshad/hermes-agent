@@ -158,6 +158,39 @@ or:
 HERMES_DESKTOP_WEB_PUBLIC_URL
 ```
 
+Desktop Web authentication is independent from Dashboard authentication. Loopback
+Host authorities bypass this host-level gate; every non-loopback/public authority
+requires the bundled username/password provider before requests are proxied.
+Configure it under the separate `desktop_web.basic_auth` namespace:
+
+```yaml
+desktop_web:
+  public_url: https://example.ts.net:13043
+  basic_auth:
+    username: desktop-user
+    password_hash: scrypt$N$r$p$base64-salt$base64-digest
+    secret: 32-or-more-random-bytes
+    session_ttl_seconds: 43200
+```
+
+`password_hash` is preferred and uses the same scrypt format as Dashboard’s
+bundled basic provider. `password` is supported as a fallback and is hashed in
+memory at startup. For secrets, environment variables override config values:
+
+```text
+HERMES_DESKTOP_WEB_BASIC_AUTH_USERNAME
+HERMES_DESKTOP_WEB_BASIC_AUTH_PASSWORD_HASH
+HERMES_DESKTOP_WEB_BASIC_AUTH_PASSWORD
+HERMES_DESKTOP_WEB_BASIC_AUTH_SECRET
+HERMES_DESKTOP_WEB_BASIC_AUTH_TTL_SECONDS
+```
+
+Keep the password/signing secret in the profile `.env` where possible. The
+Desktop Web cookie is HttpOnly, SameSite=Lax, Secure for HTTPS public authorities,
+and never forwarded to the owned backend. The backend’s separate ephemeral native
+session token is injected only into the private child proxy path and is never
+returned to the browser.
+
 Desktop Web does not use these Dashboard identities:
 
 ```text
@@ -189,6 +222,13 @@ invalid-request/502 errors.
 When Host validation is active, configure `desktop_web.public_url` with the
 canonical HTTPS hostname. Do not disable Host validation to work around a
 wrong URL.
+
+When Desktop Web is explicitly bound to `0.0.0.0` or `::`, it accepts any
+syntactically valid Host authority so reverse proxies such as Cloudflare
+Tunnels can forward their public hostname. Loopback and explicit-address binds
+remain restricted to their intended hostnames, and malformed Host authorities
+are still rejected. This Host behavior does not disable authentication,
+same-origin checks, or backend authorization.
 
 ## Build and test
 

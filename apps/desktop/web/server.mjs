@@ -8,7 +8,8 @@ import { dirname, extname, join, normalize, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import net from 'node:net'
 import tls from 'node:tls'
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomBytes, scryptSync, timingSafeEqual, randomUUID } from 'node:crypto'
+import { hostHeaderHostname, isAcceptedHost, LOOPBACK_HOSTS } from './host-validation.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const projectRoot = resolve(here, '..', '..', '..')
@@ -111,7 +112,7 @@ function runtimeRegistry(registry) {
     kind: 'local',
     label: 'This Desktop Web backend',
     url: backendUrlOverride.toString(),
-    authMode: 'oauth'
+    authMode: 'token'
   }
   const connections = registry.connections.filter(row => row.id !== 'local')
   return { ...registry, primary: 'local', connections: [local, ...connections] }
@@ -161,21 +162,232 @@ function requestedConnection(requestUrl) {
 function publicUrlFromConfig() {
   const env = validateUrl(process.env.HERMES_DESKTOP_WEB_PUBLIC_URL)
   if (env) return env
+  return validateUrl(configValue('desktop_web', 'public_url'))
+}
+
+function configValue(section, key) {
   try {
-    const text = readFileSync(join(hermesHome, 'config.yaml'), 'utf8')
-    const match = text.match(/^desktop_web:\s*\n(?:^[ \t]+[^\n]*\n)*?^[ \t]+public_url:\s*["']?([^"'\n]+)["']?\s*$/m)
-    return validateUrl(match?.[1] || '')
+    const lines = readFileSync(join(hermesHome, 'config.yaml'), 'utf8').split(/\r?\n/)
+    let inSection = false
+    let sectionIndent = -1
+    let nestedIndent = -1
+    let inNested = false
+    for (const line of lines) {
+      if (/^\S/.test(line) && !line.startsWith('desktop_web:')) {
+        inSection = false
+        inNested = false
+      }
+      const sectionMatch = line.match(/^(\s*)desktop_web:\s*(?:#.*)?$/)
+      if (sectionMatch) {
+        inSection = true
+        sectionIndent = sectionMatch[1].length
+        inNested = false
+        continue
+      }
+      if (!inSection) continue
+      const nestedMatch = line.match(/^(\s*)basic_auth:\s*(?:#.*)?$/)
+      if (nestedMatch && nestedMatch[1].length > sectionIndent) {
+        inNested = section === 'basic_auth'
+        nestedIndent = nestedMatch[1].length
+        continue
+      }
+      if (section === 'basic_auth' && inNested) {
+        const valueMatch = line.match(/^(\s*)([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$/)
+        if (valueMatch && valueMatch[1].length <= nestedIndent) {
+          inNested = false
+        } else if (valueMatch && valueMatch[1].length > nestedIndent && valueMatch[2] === key) {
+          return parseConfigScalar(valueMatch[3])
+        }
+      } else if (section === 'desktop_web') {
+        const valueMatch = line.match(/^(\s*)([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$/)
+        if (valueMatch && valueMatch[1].length > sectionIndent && valueMatch[2] === key) {
+          return parseConfigScalar(valueMatch[3])
+        }
+      }
+    }
+  } catch {
+    // Configuration is optional; callers apply safe defaults.
+  }
+  return ''
+}
+
+function parseConfigScalar(value) {
+  const raw = String(value || '').trim()
+  if (!raw || raw.startsWith('#')) return ''
+  if (raw.startsWith('"') && raw.endsWith('"')) {
+    try { return JSON.parse(raw) } catch { return raw.slice(1, -1) }
+  }
+  if (raw.startsWith("'") && raw.endsWith("'")) return raw.slice(1, -1).replace(/''/g, "'")
+  return raw.replace(/\s+#.*$/, '').trim()
+}
+
+function authConfig() {
+  const env = name => String(process.env[name] || '').trim()
+  const config = key => configValue('basic_auth', key)
+  const username = env('HERMES_DESKTOP_WEB_BASIC_AUTH_USERNAME') || config('username')
+  const envPassword = env('HERMES_DESKTOP_WEB_BASIC_AUTH_PASSWORD')
+  const passwordHash = envPassword ? '' : (env('HERMES_DESKTOP_WEB_BASIC_AUTH_PASSWORD_HASH') || config('password_hash'))
+  const password = envPassword || (!passwordHash ? config('password') : '')
+  const secretText = env('HERMES_DESKTOP_WEB_BASIC_AUTH_SECRET') || config('secret')
+  let ttl = Number(env('HERMES_DESKTOP_WEB_BASIC_AUTH_TTL_SECONDS') || config('session_ttl_seconds') || 43200)
+  if (!Number.isFinite(ttl) || ttl < 60) ttl = 43200
+  return { username, passwordHash, password, secretText, ttl: Math.floor(ttl) }
+}
+
+function decodeSecret(value) {
+  if (!value) return randomBytes(32)
+  try {
+    const decoded = Buffer.from(value, 'base64')
+    if (decoded.length >= 16) return decoded
+  } catch {}
+  try {
+    const decoded = Buffer.from(value, 'hex')
+    if (decoded.length >= 16) return decoded
+  } catch {}
+  const raw = Buffer.from(value, 'utf8')
+  return raw.length >= 16 ? raw : null
+}
+
+function parseScryptHash(encoded) {
+  try {
+    const [scheme, nText, rText, pText, saltText, digestText] = String(encoded || '').split('$')
+    const N = Number(nText), r = Number(rText), p = Number(pText)
+    if (scheme !== 'scrypt' || !Number.isInteger(N) || !Number.isInteger(r) || !Number.isInteger(p) || N < 2 || N > 2 ** 20 || r < 1 || r > 32 || p < 1 || p > 16) return null
+    const salt = Buffer.from(saltText, 'base64')
+    const digest = Buffer.from(digestText, 'base64')
+    if (!salt.length || !digest.length || digest.length > 128) return null
+    return { N, r, p, salt, digest }
   } catch {
     return null
   }
 }
 
+function derivePasswordHash(password) {
+  const salt = randomBytes(16)
+  const digest = scryptSync(password, salt, 32, { N: 2 ** 14, r: 8, p: 1, maxmem: 32 * 1024 * 1024 })
+  return { N: 2 ** 14, r: 8, p: 1, salt, digest }
+}
+
+const desktopAuthConfig = authConfig()
+const desktopAuthSecret = decodeSecret(desktopAuthConfig.secretText)
+const desktopPasswordHash = desktopAuthConfig.passwordHash
+  ? parseScryptHash(desktopAuthConfig.passwordHash)
+  : (desktopAuthConfig.password ? derivePasswordHash(desktopAuthConfig.password) : null)
+const desktopAuthEnabled = Boolean(desktopAuthConfig.username && desktopPasswordHash && desktopAuthSecret)
+const desktopSessionCookie = 'hermes_desktop_web_session'
+
 function hostAllowed(request) {
-  const requestHost = String(request.headers.host || '').toLowerCase().replace(/:\d+$/, '')
-  const boundHost = String(host).toLowerCase().replace(/^\[|\]$/g, '')
-  if (requestHost === boundHost || (boundHost === '127.0.0.1' && ['localhost', '127.0.0.1', '::1'].includes(requestHost))) return true
   const publicUrl = publicUrlFromConfig()
-  return Boolean(publicUrl && requestHost === publicUrl.hostname.toLowerCase())
+  const trustedPublicHosts = publicUrl ? new Set([publicUrl.hostname.toLowerCase()]) : new Set()
+  return isAcceptedHost(request.headers.host, host, trustedPublicHosts)
+}
+
+function requestIsLoopback(request) {
+  return LOOPBACK_HOSTS.has(hostHeaderHostname(request.headers.host))
+}
+
+function cookieSecure(request) {
+  const publicUrl = publicUrlFromConfig()
+  const requestHost = hostHeaderHostname(request.headers.host)
+  return Boolean(request.socket.encrypted || (publicUrl && publicUrl.protocol === 'https:' && requestHost === publicUrl.hostname.toLowerCase()) || (request.headers['x-forwarded-proto'] === 'https' && publicUrl && requestHost === publicUrl.hostname.toLowerCase()))
+}
+
+function signSession(payload) {
+  const raw = Buffer.from(JSON.stringify(payload), 'utf8')
+  const signature = createHmac('sha256', desktopAuthSecret).update(raw).digest()
+  return Buffer.concat([raw, signature]).toString('base64url')
+}
+
+function verifySession(value) {
+  if (!desktopAuthEnabled || !value) return false
+  try {
+    const blob = Buffer.from(value, 'base64url')
+    if (blob.length <= 32) return false
+    const raw = blob.subarray(0, -32)
+    const signature = blob.subarray(-32)
+    const expected = createHmac('sha256', desktopAuthSecret).update(raw).digest()
+    if (!timingSafeEqual(signature, expected)) return false
+    const payload = JSON.parse(raw.toString('utf8'))
+    return payload?.kind === 'access' && payload?.sub === desktopAuthConfig.username && Number(payload?.exp) > Math.floor(Date.now() / 1000)
+  } catch {
+    return false
+  }
+}
+
+function sessionCookie(request) {
+  const cookies = String(request.headers.cookie || '').split(';')
+  for (const item of cookies) {
+    const [name, ...parts] = item.trim().split('=')
+    if (name === desktopSessionCookie) return parts.join('=')
+  }
+  return ''
+}
+
+function verifyPassword(password) {
+  if (!desktopPasswordHash) return false
+  try {
+    const actual = scryptSync(String(password || ''), desktopPasswordHash.salt, desktopPasswordHash.digest.length, { N: desktopPasswordHash.N, r: desktopPasswordHash.r, p: desktopPasswordHash.p, maxmem: 128 * desktopPasswordHash.N * desktopPasswordHash.r + 1024 * 1024 })
+    return actual.length === desktopPasswordHash.digest.length && timingSafeEqual(actual, desktopPasswordHash.digest)
+  } catch {
+    return false
+  }
+}
+
+function desktopAuthAllowed(request) {
+  return requestIsLoopback(request) || (desktopAuthEnabled && verifySession(sessionCookie(request)))
+}
+
+function authCookie(request, value, maxAge) {
+  return `${desktopSessionCookie}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${cookieSecure(request) ? '; Secure' : ''}`
+}
+
+function loginPage(next = '/') {
+  const safeNext = String(next || '/').startsWith('/') && !String(next).startsWith('//') ? String(next) : '/'
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes Desktop Web — Sign in</title><style>body{font:16px system-ui,sans-serif;max-width:28rem;margin:12vh auto;padding:1rem;color:#eee;background:#171717}form{display:grid;gap:.8rem}input,button{font:inherit;padding:.7rem;border-radius:.4rem;border:1px solid #555}button{cursor:pointer;background:#fff;color:#111}#error{color:#f88;min-height:1.3em}</style></head><body><h1>Sign in to Hermes Desktop Web</h1><form method="post" action="/api/desktop-web-auth/login"><label>Username<input name="username" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><input type="hidden" name="next" value="${safeNext.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}"><button type="submit">Sign in</button></form><p id="error"></p></body></html>`
+}
+
+function redirect(response, location, headers = {}) {
+  response.writeHead(302, { location, 'cache-control': 'no-store', ...headers })
+  response.end()
+}
+
+function readForm(request) {
+  return readBody(request).then(body => new URLSearchParams(body))
+}
+
+async function handleDesktopAuth(request, response, parsed) {
+  if (parsed.pathname === '/login' && request.method === 'GET') {
+    if (requestIsLoopback(request) || (desktopAuthEnabled && verifySession(sessionCookie(request)))) {
+      redirect(response, '/')
+      return true
+    }
+    if (!desktopAuthEnabled) { json(response, 503, { error: 'Desktop Web basic authentication is not configured.' }); return true }
+    response.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'text/html; charset=utf-8' })
+    response.end(loginPage(parsed.searchParams.get('next') || '/'))
+    return true
+  }
+  if (parsed.pathname === '/api/desktop-web-auth/login' && request.method === 'POST') {
+    if (!desktopAuthEnabled) { json(response, 503, { error: 'Desktop Web basic authentication is not configured.' }); return true }
+    const form = await readForm(request)
+    const username = String(form.get('username') || '')
+    const password = String(form.get('password') || '')
+    const suppliedUsername = Buffer.from(username)
+    const configuredUsername = Buffer.from(desktopAuthConfig.username)
+    const usernameOk = suppliedUsername.length === configuredUsername.length && timingSafeEqual(suppliedUsername, configuredUsername)
+    const passwordOk = verifyPassword(password)
+    if (!usernameOk || !passwordOk) { json(response, 401, { error: 'Invalid username or password.' }, { 'www-authenticate': 'Basic realm="Hermes Desktop Web"' }); return true }
+    const now = Math.floor(Date.now() / 1000)
+    const token = signSession({ sub: desktopAuthConfig.username, kind: 'access', exp: now + desktopAuthConfig.ttl })
+    const next = String(form.get('next') || '/')
+    const safeNext = next.startsWith('/') && !next.startsWith('//') ? next : '/'
+    redirect(response, safeNext, { 'set-cookie': authCookie(request, token, desktopAuthConfig.ttl) })
+    return true
+  }
+  if (parsed.pathname === '/logout' && (request.method === 'GET' || request.method === 'POST')) {
+    redirect(response, '/login', { 'set-cookie': authCookie(request, '', 0) })
+    return true
+  }
+  return false
 }
 
 function sameOrigin(request) {
@@ -348,21 +560,45 @@ function targetPath(target, incomingPath) {
   return `${prefix}${incoming.startsWith('/') ? incoming : `/${incoming}`}` || '/'
 }
 
+function isOwnedBackendTarget(target) {
+  return Boolean(backendUrlOverride && target.origin === backendUrlOverride.origin && target.pathname === backendUrlOverride.pathname)
+}
+
+function targetRequestPath(target, incoming, includeOwnedToken = false) {
+  const search = new URLSearchParams(incoming.searchParams)
+  if (isOwnedBackendTarget(target)) {
+    search.delete('ticket')
+    search.delete('token')
+    if (includeOwnedToken) search.set('token', String(process.env.HERMES_DESKTOP_WEB_BACKEND_TOKEN || ''))
+  }
+  const suffix = search.toString()
+  return `${targetPath(target, incoming.pathname)}${suffix ? `?${suffix}` : ''}`
+}
+
 function targetHeaders(request, target) {
   const headers = { ...request.headers }
   headers.host = target.host
   headers.origin = target.origin
   delete headers['content-length']
+  // The browser only authenticates to this host with its own HttpOnly cookie.
+  // Never relay that credential, or a browser-supplied native token, upstream.
+  delete headers.cookie
+  delete headers['x-hermes-session-token']
+  if (isOwnedBackendTarget(target)) {
+    delete headers.authorization
+    headers['x-hermes-session-token'] = String(process.env.HERMES_DESKTOP_WEB_BACKEND_TOKEN || '')
+  }
   return headers
 }
 
 function proxyHttp(request, response, target) {
   const transport = target.protocol === 'https:' ? httpsRequest : httpRequest
+  const incoming = new URL(request.url || '/', `http://${host}:${port}`)
   const outgoing = transport({
     hostname: target.hostname,
     port: target.port || (target.protocol === 'https:' ? 443 : 80),
     method: request.method,
-    path: targetPath(target, new URL(request.url || '/', `http://${host}:${port}`).pathname) + (new URL(request.url || '/', `http://${host}:${port}`).search || ''),
+    path: targetRequestPath(target, incoming),
     headers: targetHeaders(request, target),
     rejectUnauthorized: true
   }, upstream => {
@@ -382,11 +618,12 @@ function proxyWebSocket(request, socket, head, target) {
   const connect = secure ? tls.connect({ host: target.hostname, port: targetPort, servername: target.hostname }) : net.connect(targetPort, target.hostname)
   connect.once('connect', () => {
     const incoming = new URL(request.url || '/', `http://${host}:${port}`)
-    const lines = [`${request.method || 'GET'} ${targetPath(target, incoming.pathname)}${incoming.search} HTTP/1.1`]
+    const lines = [`${request.method || 'GET'} ${targetRequestPath(target, incoming, true)} HTTP/1.1`]
     for (const [name, value] of Object.entries(request.headers)) {
-      if (['host', 'origin', 'connection', 'content-length'].includes(name.toLowerCase())) continue
+      if (['host', 'origin', 'connection', 'content-length', 'cookie', 'authorization', 'x-hermes-session-token'].includes(name.toLowerCase())) continue
       lines.push(`${name}: ${value}`)
     }
+    if (isOwnedBackendTarget(target)) lines.push(`x-hermes-session-token: ${process.env.HERMES_DESKTOP_WEB_BACKEND_TOKEN || ''}`)
     lines.push(`host: ${target.host}`, `origin: ${target.origin}`, 'connection: Upgrade', 'upgrade: websocket', '', '')
     connect.write(lines.join('\r\n'))
     if (head?.length) connect.write(head)
@@ -430,8 +667,13 @@ function serveFile(file, response) {
 const server = createServer(async (request, response) => {
   if (!hostAllowed(request)) return json(response, 400, { error: 'Invalid Host header.' })
   const incoming = new URL(request.url || '/', `http://${host}:${port}`)
-  if (incoming.pathname === '/healthz') return json(response, 200, { ok: true, service: 'hermes-desktop-web', port, backend: backendUrlOverride?.origin || null, configured: Boolean(selectedConnection()) })
   if (!sameOrigin(request)) return json(response, 403, { error: 'Cross-origin state-changing requests are forbidden.' })
+  if (await handleDesktopAuth(request, response, incoming)) return
+  if (!desktopAuthAllowed(request)) {
+    if (incoming.pathname.startsWith('/api/') || incoming.pathname === '/healthz') return json(response, 401, { error: 'Desktop Web authentication required.' }, { 'www-authenticate': 'Basic realm="Hermes Desktop Web"' })
+    return redirect(response, `/login?next=${encodeURIComponent(`${incoming.pathname}${incoming.search}`)}`)
+  }
+  if (incoming.pathname === '/healthz') return json(response, 200, { ok: true, service: 'hermes-desktop-web', port, backend: backendUrlOverride?.origin || null, configured: Boolean(selectedConnection()) })
   if (await handleLocalRoute(request, response, incoming)) return
   if (isProxyPath(incoming.pathname)) {
     try {
@@ -451,6 +693,15 @@ const server = createServer(async (request, response) => {
 
 server.on('upgrade', async (request, socket, head) => {
   if (!hostAllowed(request)) return socket.destroy()
+  const origin = request.headers.origin
+  if (origin) {
+    try {
+      if (new URL(origin).host !== request.headers.host) return socket.destroy()
+    } catch {
+      return socket.destroy()
+    }
+  }
+  if (!desktopAuthAllowed(request)) return socket.destroy()
   try {
     const incoming = new URL(request.url || '/', `http://${host}:${port}`)
     if (!isProxyPath(incoming.pathname)) return socket.destroy()
