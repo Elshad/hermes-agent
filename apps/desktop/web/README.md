@@ -1,14 +1,30 @@
 # Hermes Desktop Web
 
-Browser host for the complete Hermes Desktop renderer.
+Hermes Desktop Web is the browser counterpart of native Hermes Desktop. It
+imports the complete Desktop renderer directly from `apps/desktop/src` and
+replaces only the Electron host boundary with a browser adapter.
 
-The UI is imported directly from `../src`; it is not copied into this folder and
-it is not modified for the web host. `src/main.ts` installs the browser
-`window.hermesDesktop` adapter before dynamically importing `@desktop/main`.
+The Desktop renderer is not copied into this directory and must not be edited
+to support Web.
 
-## Run through Hermes
+## Architecture
 
-From the repository root:
+```text
+hermes dashboard
+    └── independent Dashboard service, normally 127.0.0.1:9119
+
+hermes desktop-web
+    ├── Python Desktop Web launcher
+    ├── dedicated headless Hermes backend child
+    │   └── private OS-assigned loopback port
+    └── standalone Web host
+        └── 127.0.0.1:13043
+```
+
+The two commands are independent and may run in parallel. Desktop Web does not
+call `hermes dashboard`, reuse its process, or stop it.
+
+## Start
 
 ```bash
 hermes desktop-web
@@ -21,81 +37,203 @@ host: 127.0.0.1
 port: 13043
 ```
 
-Dashboard-style lifecycle options:
+The command follows the native Desktop lifecycle as closely as possible:
+
+1. builds or reuses the Desktop Web `dist`;
+2. starts an owned child:
+
+   ```text
+   hermes serve --host 127.0.0.1 --port 0 --no-open --isolated
+   ```
+
+3. waits for the child’s internal:
+
+   ```text
+   HERMES_BACKEND_READY port=<private-port>
+   ```
+
+4. starts `web/server.mjs` with that private backend URL;
+5. emits:
+
+   ```text
+   HERMES_DESKTOP_WEB_READY port=13043
+   ```
+
+6. stops the Web host and its owned backend child together.
+
+The backend child is the real Hermes Agent runtime. It owns sessions, profiles,
+model/provider calls, tools, Gateway RPC, filesystem operations, Git operations,
+and agent execution. The Web process is only the browser host and transport
+adapter.
+
+## Command options
 
 ```bash
 hermes desktop-web --help
-hermes desktop-web --status
-hermes desktop-web --stop
+hermes desktop-web --host 127.0.0.1 --port 13043
 hermes desktop-web --no-open
 hermes desktop-web --skip-build
-hermes desktop-web --host 127.0.0.1 --port 13043
+hermes desktop-web --status
+hermes desktop-web --stop
 ```
 
-`desktop-web` builds this package with the existing Desktop workspace toolchain,
-then starts its own standalone HTTP/WebSocket host on `13043` and a dedicated
-headless `hermes serve --port 0 --isolated` child backend. The child uses the
-same Hermes profile/runtime environment as native Desktop and is stopped when
-the Desktop Web host exits. Desktop Web does not launch Electron and does not
-call `hermes dashboard`; Dashboard remains a separate parallel service. The
-Desktop Web settings UI controls the connection/profile behavior exposed to the
-browser.
+- `--host` — Web host bind address; default `127.0.0.1`.
+- `--port` — Web host port; default `13043`; `0` allows OS assignment.
+- `--no-open` — do not open a browser.
+- `--skip-build` — require and use the existing `dist/index.html`.
+- `--status` — show only Desktop Web’s process tree and exit.
+- `--stop` — stop only Desktop Web and its owned backend child.
 
-The process sets `HERMES_DESKTOP_WEB=1`, emits `HERMES_DESKTOP_WEB_READY`, and
-uses the separate `desktop_web.public_url` configuration key (or
-`HERMES_DESKTOP_WEB_PUBLIC_URL`). It does not use Dashboard's
-`HERMES_DASHBOARD_READY` or `dashboard.public_url` identity.
+`--stop` never stops Dashboard or an independently started Hermes backend.
 
-## Development commands
+## Browser bridge
+
+`web/src/preload.ts` implements the browser version of the
+`window.hermesDesktop` contract declared by the untouched Desktop renderer.
+
+`web/src/main.ts` installs that bridge before importing the Desktop entrypoint:
+
+```ts
+import { installWebHermesDesktop } from './preload'
+
+installWebHermesDesktop()
+void import('@desktop/main')
+```
+
+Supported browser/backend paths include:
+
+- HTTP API requests through the owned backend proxy;
+- authenticated Gateway WebSocket forwarding;
+- filesystem tree/read/write operations through backend APIs;
+- Git status, diff, review, branch, and worktree APIs;
+- browser clipboard and notifications;
+- browser microphone permissions;
+- browser file selection and downloads;
+- external links and browser tabs;
+- browser-local zoom behavior.
+
+Electron-only capabilities are intentionally unavailable or degraded safely:
+
+- native PTY terminal;
+- OS terminal launching;
+- HUD and pet overlay windows;
+- global OS shortcuts;
+- native file dialogs;
+- OS reveal/trash/rename;
+- Electron updater/bootstrap/uninstall;
+- OS window inspection;
+- native plugin installation;
+- Electron-specific PR-comment operations.
+
+Unsupported methods must not be implemented as arbitrary command execution or
+repeated startup alerts.
+
+## Backend and settings
+
+Desktop Web starts a dedicated local backend child on every normal invocation,
+matching native Desktop’s local startup behavior. The child uses the active
+Hermes profile/home environment and listens only on a private OS-assigned
+loopback port.
+
+The browser bridge also exposes the Desktop connection/settings contract. Web
+connection metadata is stored separately under:
+
+```text
+$HERMES_HOME/desktop-web/connections.json
+```
+
+Browser credentials are not stored in `localStorage` or returned in registry
+responses. Backend authentication remains the source of truth.
+
+Desktop Web has its own public URL configuration:
+
+```yaml
+desktop_web:
+  public_url: https://example.ts.net:13043
+```
+
+or:
+
+```text
+HERMES_DESKTOP_WEB_PUBLIC_URL
+```
+
+Desktop Web does not use these Dashboard identities:
+
+```text
+HERMES_DASHBOARD_READY
+HERMES_DASHBOARD_PUBLIC_URL
+dashboard.public_url
+```
+
+## Tailscale
+
+The Web host speaks plain HTTP locally. Tailscale Serve should terminate HTTPS
+and proxy to HTTP:
+
+```bash
+tailscale serve --bg --https=13043 http://127.0.0.1:13043
+tailscale serve status --json
+```
+
+Use the canonical HTTPS hostname:
+
+```text
+https://<tailscale-machine-name>:13043/
+```
+
+Do not configure the local upstream as
+`https://127.0.0.1:13043`; that sends TLS to the plain-HTTP Web host and causes
+invalid-request/502 errors.
+
+When Host validation is active, configure `desktop_web.public_url` with the
+canonical HTTPS hostname. Do not disable Host validation to work around a
+wrong URL.
+
+## Build and test
+
+Use the existing Desktop workspace tools; do not add another frontend or proxy
+stack:
 
 ```bash
 npm install --workspace apps/desktop/web
 npm run typecheck --workspace apps/desktop/web
 npm test --workspace apps/desktop/web
 npm run build --workspace apps/desktop/web
+node --check apps/desktop/web/server.mjs
+python3 -m py_compile hermes_cli/main.py hermes_cli/subcommands/desktop_web.py
 ```
 
-The typecheck project is `../tsconfig.web.json`. It includes the imported Desktop
-renderer graph but excludes Electron sources. TypeScript's `noCheck` mode is
-intentional here because the current upstream renderer graph has declaration and
-union diagnostics unrelated to the web adapter; Vite remains the actual full
-module/syntax/build check.
+The web build imports the complete Desktop source graph directly through the
+Vite aliases in `web/vite.config.ts`. It uses the existing React Compiler,
+Tailwind, Vite, TypeScript, and Vitest versions.
 
-## Browser bridge
+`tsconfig.web.json` includes the imported Desktop/shared graph and excludes
+Electron. TypeScript `noCheck` is currently intentional because the untouched
+upstream graph has unrelated declaration/union diagnostics; Vite’s production
+build is the full browser module/syntax validation, supplemented by Web tests.
 
-`src/preload.ts` implements the renderer's `window.hermesDesktop` contract.
-Backend-owned operations use the existing Dashboard API and Gateway contracts:
+## Source rules for contributors
 
-- HTTP requests use same-origin `fetch` with cookies;
-- OAuth WebSocket connections mint fresh `/api/auth/ws-ticket` tickets;
-- filesystem methods use `/api/fs/*`;
-- Git/review methods use `/api/git/*` with Electron-compatible response shapes;
-- clipboard, notifications, microphone, file selection, downloads, and external
-  links use browser APIs where safe.
+Do not:
 
-Electron-only operations such as native PTY terminals, HUD/pet windows, native
-file-manager dialogs, updater, bootstrap, and OS-level window inspection reject
-with a controlled capability error. They must not be replaced with arbitrary
-command execution or fake absolute browser filesystem paths.
+- copy `apps/desktop/src` into `apps/desktop/web`;
+- edit `apps/desktop/src/**`;
+- edit `apps/desktop/electron/**`;
+- import Electron or Node runtime modules into browser code;
+- use `cmd_dashboard` for Desktop Web startup;
+- add a second chat UI;
+- add an unauthenticated arbitrary command endpoint;
+- put credentials in source, browser storage, fixtures, screenshots, or logs.
 
-## Build configuration
+The required CLI integration lives in:
 
-`vite.config.ts` reuses the Desktop React Compiler, Tailwind, Vite, dependency
-aliases, public assets, fonts, emoji data, and driver.js handling. The aliases
-resolve `@desktop` and `@` to the live `apps/desktop/src` tree. Do not add a
-second UI implementation or edit the authoritative Desktop renderer to solve a
-web-host issue.
+```text
+hermes_cli/main.py
+hermes_cli/subcommands/desktop_web.py
+```
 
-## Security
+Dashboard implementation files remain independent and should not be changed for
+Desktop Web behavior.
 
-- default listener is loopback-only;
-- Dashboard authentication remains in force;
-- WebSocket upgrades go through the Dashboard server;
-- browser credentials are not placed in source or localStorage;
-- unsafe custom connection headers are filtered;
-- explicit unknown connection IDs fail closed;
-- filesystem/Git validation remains server-side;
-- no unauthenticated arbitrary command endpoint is provided.
-
-See `plan001.md` for the complete parity matrix, implementation plan, browser
-limitations, verification commands, and upstream-update procedure.
+See `plan001.md` for the detailed implementation plan and acceptance matrix.
