@@ -2,9 +2,9 @@
 
 > **For Hermes:** Implement this plan task-by-task with the existing Hermes Desktop build/test workflow. Do not copy or edit the Desktop renderer source. Keep the browser host adapter inside `apps/desktop/web`.
 
-**Goal:** Make `hermes desktop-web` serve the complete Hermes Desktop React UI in a normal browser, using the existing Hermes Desktop/Vite/Tailwind dependency graph, replacing Electron’s `window.hermesDesktop` bridge with a browser/VPS adapter, and connecting to the already-running Hermes Agent/Dashboard through the same authenticated HTTP/WebSocket contracts used by Desktop.
+**Goal:** Make `hermes desktop-web` serve the complete Hermes Desktop React UI in a normal browser, using the existing Hermes Desktop/Vite/Tailwind dependency graph, replacing Electron’s `window.hermesDesktop` bridge with a browser adapter, and managing a dedicated headless Hermes backend child with the same lifecycle model as native Desktop.
 
-**Architecture:** `apps/desktop/web` is a web host around the existing Desktop renderer. Its entrypoint installs a browser implementation of `window.hermesDesktop` before dynamically importing the untouched `apps/desktop/src/main.tsx`; the adapter forwards backend-owned operations to same-origin Dashboard HTTP/WebSocket routes and maps browser capabilities where safe. The web command follows `hermes dashboard` lifecycle behavior, but its default UI port is `13043` and it must not start a second Hermes Agent backend when the existing backend is already available.
+**Architecture:** `apps/desktop/web` is a standalone web host around the existing Desktop renderer. Its entrypoint installs a browser implementation of `window.hermesDesktop` before dynamically importing the untouched `apps/desktop/src/main.tsx`; the adapter forwards backend-owned operations through the standalone host to the backend selected in Desktop Web settings. The web command is independent from `hermes dashboard`: both may run in parallel, and Desktop Web owns only its own UI process and port `13043`.
 
 **Tech Stack:** Existing Desktop package dependencies only: React, React DOM, Vite, Tailwind CSS 4, React Compiler/Babel plugin, TypeScript, Vitest, and existing Hermes shared modules. No new runtime dependency, server framework, Node HTTP framework, PTY package, Electron package, or alternate frontend stack.
 
@@ -107,7 +107,7 @@ host: 127.0.0.1
 port: 13043
 ```
 
-It should connect to the existing Hermes Agent/Dashboard using the same configured backend behavior as `hermes dashboard`. The address `127.0.0.1:13001` may be used for local testing on this machine, but must not be hardcoded as the web product’s user-facing default agent address.
+It starts a dedicated `hermes serve --host 127.0.0.1 --port 0 --isolated` child for each Desktop Web invocation. The child uses an OS-assigned private loopback port; Desktop Web exposes only port `13043`. The address `127.0.0.1:13001` may be used for local testing on this machine, but must not be hardcoded as the Desktop Web backend default. Desktop Web settings remain the renderer-facing configuration surface for connection/profile behavior.
 
 ### 1.4 Dashboard-style lifecycle flags
 

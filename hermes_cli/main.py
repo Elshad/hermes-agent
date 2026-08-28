@@ -8268,8 +8268,6 @@ def cmd_gui(args: argparse.Namespace):
 
     # with_hermes_node_path() copies os.environ when called with no arg.
     env = with_hermes_node_path()
-    if getattr(args, "web", False):
-        env["HERMES_DESKTOP_WEB"] = "1"
     if getattr(args, "fake_boot", False):
         env["HERMES_DESKTOP_BOOT_FAKE"] = "1"
     if getattr(args, "ignore_existing", False):
@@ -11938,19 +11936,34 @@ def _desktop_web_processes() -> list[tuple[int, str]]:
     except Exception:
         return []
 
-    result = []
     current = os.getpid()
-    for process in psutil.process_iter(["pid", "cmdline"]):
+    candidates = {}
+    for process in psutil.process_iter(["pid", "ppid", "cmdline"]):
         try:
-            if process.info["pid"] == current:
-                continue
             argv = process.info.get("cmdline") or []
-            command = " ".join(argv)
-            if "-m" in argv and "hermes_cli.main" in argv and "desktop-web" in argv:
-                result.append((process.info["pid"], command))
+            candidates[process.info["pid"]] = (process.info.get("ppid"), argv, process)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    return result
+
+    roots = set()
+    for pid, (_ppid, argv, _process) in candidates.items():
+        if pid == current:
+            continue
+        is_launcher = "-m" in argv and "hermes_cli.main" in argv and "desktop-web" in argv
+        is_server = any(str(item).endswith("apps/desktop/web/server.mjs") for item in argv) and "--desktop-web" in argv
+        if is_launcher or is_server:
+            roots.add(pid)
+
+    owned = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, _argv, _process) in candidates.items():
+            if ppid in owned and pid not in owned:
+                owned.add(pid)
+                changed = True
+
+    return [(pid, " ".join(candidates[pid][1])) for pid in sorted(owned)]
 
 
 def _stop_desktop_web_processes() -> bool:
@@ -11982,7 +11995,7 @@ def _stop_desktop_web_processes() -> bool:
 
 
 def cmd_desktop_web(args):
-    """Build and serve the Desktop renderer through the Dashboard server."""
+    """Build and serve the standalone Desktop Web host."""
     web_dir = PROJECT_ROOT / "apps" / "desktop" / "web"
     dist_dir = web_dir / "dist"
     if not (web_dir / "package.json").exists():
@@ -12006,8 +12019,7 @@ def cmd_desktop_web(args):
         return 2
 
     env = os.environ.copy()
-    env["HERMES_WEB_DIST"] = str(dist_dir.resolve())
-    env.pop("HERMES_SERVE_HEADLESS", None)
+    env["HERMES_DESKTOP_WEB"] = "1"
 
     if args.skip_build:
         if not (dist_dir / "index.html").exists():
@@ -12043,22 +12055,100 @@ def cmd_desktop_web(args):
             print("✗ Desktop Web build failed or produced no dist/index.html", file=sys.stderr)
             return build.returncode or 1
 
-    os.environ.update(env)
-    dashboard_args = argparse.Namespace(
-        host=args.host,
-        port=args.port,
-        no_open=args.no_open,
-        skip_build=True,
-        status=False,
-        stop=False,
-        insecure=False,
-        isolated=True,
-        open_profile="",
-        headless_backend=False,
-        ssh_session_token_file=None,
-        ssh_owner_nonce=None,
+    node = shutil.which("node")
+    if not node:
+        print("Desktop Web requires Node.js, but node was not found on PATH.", file=sys.stderr)
+        return 1
+
+    import selectors
+    import time
+
+    backend_env = os.environ.copy()
+    backend_env.pop("HERMES_DESKTOP_WEB", None)
+    backend_env.pop("HERMES_DESKTOP_WEB_PUBLIC_URL", None)
+    backend_env.pop("HERMES_WEB_DIST", None)
+    backend_env["HERMES_DESKTOP_WEB_CHILD"] = "1"
+    backend_command = [
+        sys.executable, "-m", "hermes_cli.main", "serve",
+        "--host", "127.0.0.1", "--port", "0", "--no-open", "--isolated",
+    ]
+    print("→ Starting dedicated Hermes backend child...")
+    backend = subprocess.Popen(
+        backend_command,
+        cwd=PROJECT_ROOT,
+        env=backend_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
-    return cmd_dashboard(dashboard_args)
+
+    backend_port = None
+    backend_deadline = time.monotonic() + 90
+    backend_selector = selectors.DefaultSelector()
+    assert backend.stdout is not None
+    backend_selector.register(backend.stdout, selectors.EVENT_READ)
+    try:
+        while time.monotonic() < backend_deadline:
+            if backend.poll() is not None:
+                break
+            for key, _events in backend_selector.select(timeout=0.25):
+                line = backend.stdout.readline()
+                if not line:
+                    continue
+                print(f"[backend] {line.rstrip()}")
+                match = re.search(r"HERMES_BACKEND_READY port=(\d+)", line)
+                if match:
+                    backend_port = int(match.group(1))
+                    break
+            if backend_port is not None:
+                break
+        if backend_port is None:
+            print("✗ Dedicated Hermes backend did not become ready.", file=sys.stderr)
+            return 1
+
+        command = [
+            node,
+            str(web_dir / "server.mjs"),
+            "--desktop-web",
+            "--host", args.host,
+            "--port", str(args.port),
+            "--backend-url", f"http://127.0.0.1:{backend_port}",
+        ]
+        print(f"→ Starting standalone Desktop Web on {args.host}:{args.port}")
+        web = subprocess.Popen(command, cwd=web_dir, env=env)
+        try:
+            if not args.no_open:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline and web.poll() is None:
+                    if _dashboard_listening(args.host, args.port):
+                        try:
+                            import webbrowser
+                            webbrowser.open(f"http://{args.host}:{args.port}")
+                        except Exception:
+                            pass
+                        break
+                    time.sleep(0.1)
+            return web.wait()
+        except KeyboardInterrupt:
+            web.terminate()
+            return web.wait()
+        finally:
+            if web.poll() is None:
+                web.terminate()
+                try:
+                    web.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    web.kill()
+    finally:
+        backend_selector.close()
+        if backend.poll() is None:
+            backend.terminate()
+            try:
+                backend.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                backend.kill()
+                backend.wait()
 
 
 def cmd_dashboard(args):

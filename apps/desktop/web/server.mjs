@@ -1,0 +1,474 @@
+#!/usr/bin/env node
+
+import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, chmodSync } from 'node:fs'
+import { createServer, request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { homedir } from 'node:os'
+import { dirname, extname, join, normalize, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import net from 'node:net'
+import tls from 'node:tls'
+import { randomUUID } from 'node:crypto'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const projectRoot = resolve(here, '..', '..', '..')
+const distRoot = resolve(here, 'dist')
+const desktopRoot = resolve(here, '..')
+const uiFontsRoot = resolve(desktopRoot, 'node_modules/@nous-research/ui/dist/fonts')
+const args = process.argv.slice(2)
+
+function flag(name, fallback) {
+  const index = args.indexOf(name)
+  return index >= 0 && args[index + 1] ? args[index + 1] : fallback
+}
+
+const host = flag('--host', process.env.HERMES_DESKTOP_WEB_HOST || '127.0.0.1')
+const port = Number(flag('--port', process.env.HERMES_DESKTOP_WEB_PORT || '13043'))
+const backendUrlOverride = validateUrl(flag('--backend-url', process.env.HERMES_DESKTOP_WEB_BACKEND_URL || ''))
+const hermesHome = resolve(process.env.HERMES_HOME || join(homedir(), '.hermes'))
+const stateRoot = join(hermesHome, 'desktop-web')
+const registryFile = join(stateRoot, 'connections.json')
+const maxBodyBytes = 16 * 1024 * 1024
+
+const proxyPrefixes = ['/api/', '/api', '/auth/', '/auth', '/login', '/logout', '/oauth/', '/oauth']
+const localRoutes = new Set([
+  '/api/web-connections',
+  '/api/web-connection-config',
+  '/api/web-connection-config/save',
+  '/api/web-connection-config/test',
+  '/api/web-connection-session',
+  '/api/web-connections/save',
+  '/api/web-connections/remove',
+  '/api/web-connections/primary',
+  '/api/web-connections/launch-mode',
+  '/api/web-connections/last-used',
+  '/api/web-connections/test'
+])
+
+const mime = {
+  '.css': 'text/css; charset=utf-8',
+  '.gif': 'image/gif',
+  '.html': 'text/html; charset=utf-8',
+  '.ico': 'image/x-icon',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ttf': 'font/ttf',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2'
+}
+
+function json(response, status, value, headers = {}) {
+  response.writeHead(status, {
+    'cache-control': 'no-store',
+    'content-type': 'application/json; charset=utf-8',
+    ...headers
+  })
+  response.end(JSON.stringify(value))
+}
+
+function safeRegistry(registry) {
+  return {
+    version: 1,
+    primary: registry.primary,
+    connections: registry.connections.map(({ token, headers, ...connection }) => ({
+      ...connection,
+      tokenSet: Boolean(token),
+      tokenPreview: null
+    }))
+  }
+}
+
+function fallbackRegistry() {
+  return {
+    version: 1,
+    primary: '',
+    connections: []
+  }
+}
+
+function readRegistry() {
+  try {
+    const value = JSON.parse(readFileSync(registryFile, 'utf8'))
+    if (!value || typeof value !== 'object' || !Array.isArray(value.connections)) return runtimeRegistry(fallbackRegistry())
+    const connections = value.connections.filter(row => row && typeof row === 'object' && typeof row.id === 'string' && typeof row.label === 'string')
+    const primary = typeof value.primary === 'string' && connections.some(row => row.id === value.primary) ? value.primary : (connections[0]?.id || '')
+    return runtimeRegistry({ version: 1, primary, connections })
+  } catch {
+    return runtimeRegistry(fallbackRegistry())
+  }
+}
+
+function runtimeRegistry(registry) {
+  if (!backendUrlOverride) return registry
+  const local = {
+    id: 'local',
+    kind: 'local',
+    label: 'This Desktop Web backend',
+    url: backendUrlOverride.toString(),
+    authMode: 'oauth'
+  }
+  const connections = registry.connections.filter(row => row.id !== 'local')
+  return { ...registry, primary: 'local', connections: [local, ...connections] }
+}
+
+function writeRegistry(registry) {
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  const temporary = `${registryFile}.${process.pid}.${randomUUID()}.tmp`
+  writeFileSync(temporary, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 })
+  chmodSync(temporary, 0o600)
+  renameSync(temporary, registryFile)
+  chmodSync(registryFile, 0o600)
+}
+
+function validateUrl(value) {
+  try {
+    const url = new URL(String(value || '').trim())
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null
+    url.hash = ''
+    url.search = ''
+    url.pathname = url.pathname.replace(/\/+$/, '')
+    return url
+  } catch {
+    return null
+  }
+}
+
+function selectedConnection(id) {
+  const registry = readRegistry()
+  const requested = String(id || '').trim()
+  const selected = requested ? registry.connections.find(row => row.id === requested) : registry.connections.find(row => row.id === registry.primary)
+  if (requested && !selected) throw new Error('Connection not found.')
+  return selected || null
+}
+
+function connectionTarget(connection) {
+  const url = validateUrl(connection?.url)
+  if (!url) throw new Error('Desktop Web backend URL is not configured.')
+  return url
+}
+
+function requestedConnection(requestUrl) {
+  const parsed = new URL(requestUrl || '/', `http://${host}:${port}`)
+  return { parsed, connection: selectedConnection(parsed.searchParams.get('connectionId')) }
+}
+
+function publicUrlFromConfig() {
+  const env = validateUrl(process.env.HERMES_DESKTOP_WEB_PUBLIC_URL)
+  if (env) return env
+  try {
+    const text = readFileSync(join(hermesHome, 'config.yaml'), 'utf8')
+    const match = text.match(/^desktop_web:\s*\n(?:^[ \t]+[^\n]*\n)*?^[ \t]+public_url:\s*["']?([^"'\n]+)["']?\s*$/m)
+    return validateUrl(match?.[1] || '')
+  } catch {
+    return null
+  }
+}
+
+function hostAllowed(request) {
+  const requestHost = String(request.headers.host || '').toLowerCase().replace(/:\d+$/, '')
+  const boundHost = String(host).toLowerCase().replace(/^\[|\]$/g, '')
+  if (requestHost === boundHost || (boundHost === '127.0.0.1' && ['localhost', '127.0.0.1', '::1'].includes(requestHost))) return true
+  const publicUrl = publicUrlFromConfig()
+  return Boolean(publicUrl && requestHost === publicUrl.hostname.toLowerCase())
+}
+
+function sameOrigin(request) {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(String(request.method || 'GET').toUpperCase())) return true
+  const origin = request.headers.origin
+  if (!origin) return true
+  try {
+    return new URL(origin).host === request.headers.host
+  } catch {
+    return false
+  }
+}
+
+function isProxyPath(pathname) {
+  return proxyPrefixes.some(prefix => pathname === prefix || pathname.startsWith(prefix))
+}
+
+function readBody(request) {
+  return new Promise((resolveBody, reject) => {
+    let body = ''
+    request.on('data', chunk => {
+      body += chunk
+      if (Buffer.byteLength(body) > maxBodyBytes) {
+        reject(new Error('Request body is too large.'))
+        request.destroy()
+      }
+    })
+    request.on('end', () => resolveBody(body))
+    request.on('error', reject)
+  })
+}
+
+async function readJson(request) {
+  const body = await readBody(request)
+  if (!body.trim()) return {}
+  const value = JSON.parse(body)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('JSON object body is required.')
+  return value
+}
+
+function inputConnection(body, existing) {
+  const url = body.url === undefined ? existing?.url : String(body.url || '').trim()
+  if (url && !validateUrl(url)) throw new Error('A valid http(s) backend URL is required.')
+  const label = String(body.label ?? existing?.label ?? '').trim().slice(0, 64)
+  if (!label) throw new Error('Connection label is required.')
+  const connection = {
+    ...(existing || {}),
+    id: String(body.id || existing?.id || `web-${randomUUID()}`),
+    kind: 'remote',
+    label,
+    ...(url ? { url } : {}),
+    ...(body.authMode === 'token' || body.authMode === 'oauth' ? { authMode: body.authMode } : {})
+  }
+  // Browser credentials are intentionally never persisted by this host. The
+  // backend login/session cookie is kept by the browser for the active origin.
+  return connection
+}
+
+async function handleLocalRoute(request, response, parsed) {
+  if (!localRoutes.has(parsed.pathname)) return false
+  try {
+    if (parsed.pathname === '/api/web-connections' && request.method === 'GET') {
+      json(response, 200, safeRegistry(readRegistry()))
+      return true
+    }
+      if (parsed.pathname === '/api/web-connection-config' && request.method === 'GET') {
+      const connection = selectedConnection(parsed.searchParams.get('connectionId'))
+      json(response, 200, {
+        envOverride: Boolean(process.env.HERMES_DESKTOP_WEB_PUBLIC_URL),
+        mode: connection ? 'remote' : 'local',
+        profile: null,
+        remoteAuthMode: connection?.authMode || 'oauth',
+        remoteOauthConnected: false,
+        remoteTokenPreview: null,
+        remoteTokenSet: false,
+        secureTokenStorage: false,
+        remoteTokenPlainText: false,
+        remoteUrl: connection?.url || '',
+        cloudOrg: '',
+        sshHost: '',
+        sshUser: '',
+        sshPort: null,
+        sshKeyPath: '',
+        sshRemoteHermesPath: '',
+        sshRemoteProfile: ''
+      })
+      return true
+    }
+    if (parsed.pathname === '/api/web-connection-config/save' && request.method === 'POST') {
+      const body = await readJson(request)
+      const registry = readRegistry()
+      const existing = selectedConnection()
+      const connection = inputConnection({ ...body, id: existing?.id }, existing)
+      const duplicate = registry.connections.find(row => row.id !== connection.id && row.label.toLowerCase() === connection.label.toLowerCase())
+      if (duplicate) throw new Error('Connection label must be unique.')
+      registry.connections = existing ? registry.connections.map(row => row.id === connection.id ? connection : row) : [...registry.connections, connection]
+      if (!registry.primary) registry.primary = connection.id
+      writeRegistry(registry)
+      json(response, 200, { ok: true, config: { mode: 'remote', profile: null, remoteUrl: connection.url || '', remoteAuthMode: connection.authMode || 'oauth', remoteOauthConnected: false, remoteTokenSet: false, remoteTokenPreview: null, secureTokenStorage: false, remoteTokenPlainText: false, envOverride: false, cloudOrg: '', sshHost: '', sshUser: '', sshPort: null, sshKeyPath: '', sshRemoteHermesPath: '', sshRemoteProfile: '' }, registry: safeRegistry(registry) })
+      return true
+    }
+    if (parsed.pathname === '/api/web-connection-config/test' && request.method === 'POST') {
+      const body = await readJson(request)
+      const target = validateUrl(body.remoteUrl || body.url)
+      if (!target) throw new Error('A valid http(s) backend URL is required.')
+      const result = await probe(target)
+      json(response, 200, result)
+      return true
+    }
+    if (parsed.pathname === '/api/web-connection-session' && request.method === 'GET') {
+      const connection = selectedConnection(parsed.searchParams.get('connectionId'))
+      const result = connection ? await probe(connectionTarget(connection)) : { ok: false, connected: false }
+      json(response, 200, { connected: result.ok === true })
+      return true
+    }
+    if (parsed.pathname === '/api/web-connections/save' && request.method === 'POST') {
+      const body = await readJson(request)
+      const registry = readRegistry()
+      const connection = inputConnection(body, body.id ? registry.connections.find(row => row.id === body.id) : undefined)
+      if (registry.connections.some(row => row.id !== connection.id && row.label.toLowerCase() === connection.label.toLowerCase())) throw new Error('Connection label must be unique.')
+      registry.connections = registry.connections.filter(row => row.id !== connection.id).concat(connection)
+      if (!registry.primary) registry.primary = connection.id
+      writeRegistry(registry)
+      json(response, 200, { ok: true, connection: safeRegistry(registry).connections.find(row => row.id === connection.id), registry: safeRegistry(registry) })
+      return true
+    }
+    if (parsed.pathname === '/api/web-connections/remove' && request.method === 'POST') {
+      const body = await readJson(request)
+      const registry = readRegistry()
+      if (body.id === registry.primary) registry.primary = ''
+      registry.connections = registry.connections.filter(row => row.id !== body.id)
+      writeRegistry(registry)
+      json(response, 200, { ok: true, registry: safeRegistry(registry) })
+      return true
+    }
+    if (parsed.pathname === '/api/web-connections/primary' && request.method === 'POST') {
+      const body = await readJson(request)
+      const registry = readRegistry()
+      if (!registry.connections.some(row => row.id === body.id)) throw new Error('Connection not found.')
+      registry.primary = body.id
+      writeRegistry(registry)
+      json(response, 200, { ok: true, registry: safeRegistry(registry) })
+      return true
+    }
+    if (parsed.pathname === '/api/web-connections/launch-mode' && request.method === 'POST') {
+      json(response, 200, { ok: true, registry: safeRegistry(readRegistry()) })
+      return true
+    }
+    if (parsed.pathname === '/api/web-connections/last-used' && request.method === 'POST') {
+      json(response, 200, { ok: true, registry: safeRegistry(readRegistry()) })
+      return true
+    }
+    if (parsed.pathname === '/api/web-connections/test' && request.method === 'POST') {
+      const body = await readJson(request)
+      const connection = selectedConnection(body.id)
+      json(response, 200, await probe(connectionTarget(connection)))
+      return true
+    }
+    json(response, 405, { error: 'Method not allowed' })
+    return true
+  } catch (error) {
+    json(response, 400, { error: error instanceof Error ? error.message : 'Desktop Web control request failed' })
+    return true
+  }
+}
+
+function targetPath(target, incomingPath) {
+  const prefix = target.pathname.replace(/\/+$/, '')
+  const incoming = incomingPath || '/'
+  return `${prefix}${incoming.startsWith('/') ? incoming : `/${incoming}`}` || '/'
+}
+
+function targetHeaders(request, target) {
+  const headers = { ...request.headers }
+  headers.host = target.host
+  headers.origin = target.origin
+  delete headers['content-length']
+  return headers
+}
+
+function proxyHttp(request, response, target) {
+  const transport = target.protocol === 'https:' ? httpsRequest : httpRequest
+  const outgoing = transport({
+    hostname: target.hostname,
+    port: target.port || (target.protocol === 'https:' ? 443 : 80),
+    method: request.method,
+    path: targetPath(target, new URL(request.url || '/', `http://${host}:${port}`).pathname) + (new URL(request.url || '/', `http://${host}:${port}`).search || ''),
+    headers: targetHeaders(request, target),
+    rejectUnauthorized: true
+  }, upstream => {
+    response.writeHead(upstream.statusCode || 502, upstream.headers)
+    upstream.pipe(response)
+  })
+  outgoing.on('error', error => {
+    if (!response.headersSent) json(response, 502, { error: 'Configured Hermes backend is unavailable.' })
+    else response.destroy(error)
+  })
+  request.pipe(outgoing)
+}
+
+function proxyWebSocket(request, socket, head, target) {
+  const targetPort = Number(target.port || (target.protocol === 'https:' ? 443 : 80))
+  const secure = target.protocol === 'https:'
+  const connect = secure ? tls.connect({ host: target.hostname, port: targetPort, servername: target.hostname }) : net.connect(targetPort, target.hostname)
+  connect.once('connect', () => {
+    const incoming = new URL(request.url || '/', `http://${host}:${port}`)
+    const lines = [`${request.method || 'GET'} ${targetPath(target, incoming.pathname)}${incoming.search} HTTP/1.1`]
+    for (const [name, value] of Object.entries(request.headers)) {
+      if (['host', 'origin', 'connection', 'content-length'].includes(name.toLowerCase())) continue
+      lines.push(`${name}: ${value}`)
+    }
+    lines.push(`host: ${target.host}`, `origin: ${target.origin}`, 'connection: Upgrade', 'upgrade: websocket', '', '')
+    connect.write(lines.join('\r\n'))
+    if (head?.length) connect.write(head)
+    socket.pipe(connect).pipe(socket)
+  })
+  connect.on('error', () => socket.destroy())
+  socket.on('error', () => connect.destroy())
+}
+
+async function probe(target) {
+  return await new Promise(resolveProbe => {
+    const transport = target.protocol === 'https:' ? httpsRequest : httpRequest
+    const req = transport({ hostname: target.hostname, port: target.port || (target.protocol === 'https:' ? 443 : 80), path: `${target.pathname || ''}/api/status`, method: 'GET', headers: { accept: 'application/json', host: target.host }, timeout: 8_000, rejectUnauthorized: true }, response => {
+      response.resume()
+      resolveProbe({ ok: response.statusCode >= 200 && response.statusCode < 400, reachable: true, authenticated: response.statusCode !== 401 && response.statusCode !== 403, status: response.statusCode })
+    })
+    req.on('timeout', () => req.destroy(new Error('Backend probe timed out.')))
+    req.on('error', error => resolveProbe({ ok: false, reachable: false, error: error.message }))
+  })
+}
+
+function staticFile(pathname) {
+  if (pathname.startsWith('/fonts/')) {
+    const name = decodeURIComponent(pathname.slice('/fonts/'.length))
+    if (!name || name.includes('/') || name.includes('\\') || !name.endsWith('.woff2')) return null
+    const candidate = resolve(uiFontsRoot, name)
+    return candidate.startsWith(`${uiFontsRoot}/`) && existsSync(candidate) && statSync(candidate).isFile() ? candidate : null
+  }
+  let decoded
+  try { decoded = decodeURIComponent(pathname) } catch { return null }
+  const relative = normalize(decoded).replace(/^[/\\]+/, '')
+  const candidate = resolve(join(distRoot, relative))
+  return candidate.startsWith(`${distRoot}/`) && existsSync(candidate) && statSync(candidate).isFile() ? candidate : null
+}
+
+function serveFile(file, response) {
+  response.writeHead(200, { 'cache-control': extname(file) === '.html' ? 'no-store' : 'public, max-age=31536000, immutable', 'content-type': mime[extname(file).toLowerCase()] || 'application/octet-stream' })
+  createReadStream(file).pipe(response)
+}
+
+const server = createServer(async (request, response) => {
+  if (!hostAllowed(request)) return json(response, 400, { error: 'Invalid Host header.' })
+  const incoming = new URL(request.url || '/', `http://${host}:${port}`)
+  if (incoming.pathname === '/healthz') return json(response, 200, { ok: true, service: 'hermes-desktop-web', port, backend: backendUrlOverride?.origin || null, configured: Boolean(selectedConnection()) })
+  if (!sameOrigin(request)) return json(response, 403, { error: 'Cross-origin state-changing requests are forbidden.' })
+  if (await handleLocalRoute(request, response, incoming)) return
+  if (isProxyPath(incoming.pathname)) {
+    try {
+      const connection = selectedConnection(incoming.searchParams.get('connectionId'))
+      if (!connection) return json(response, 503, { error: 'Configure a Hermes backend in Desktop Web settings first.' })
+      return proxyHttp(request, response, connectionTarget(connection))
+    } catch (error) {
+      return json(response, 400, { error: error instanceof Error ? error.message : 'Backend proxy failed.' })
+    }
+  }
+  const file = staticFile(incoming.pathname)
+  if (file) return serveFile(file, response)
+  const index = join(distRoot, 'index.html')
+  if (existsSync(index)) return serveFile(index, response)
+  return response.end('Desktop Web is not built. Run hermes desktop-web without --skip-build.')
+})
+
+server.on('upgrade', async (request, socket, head) => {
+  if (!hostAllowed(request)) return socket.destroy()
+  try {
+    const incoming = new URL(request.url || '/', `http://${host}:${port}`)
+    if (!isProxyPath(incoming.pathname)) return socket.destroy()
+    const connection = selectedConnection(incoming.searchParams.get('connectionId'))
+    if (!connection) return socket.destroy()
+    proxyWebSocket(request, socket, head, connectionTarget(connection))
+  } catch {
+    socket.destroy()
+  }
+})
+
+if (!Number.isInteger(port) || port < 0 || port > 65535) {
+  console.error('Desktop Web port must be between 0 and 65535.')
+  process.exit(2)
+}
+
+server.listen(port, host, () => {
+  const actualPort = server.address().port
+  console.log(`HERMES_DESKTOP_WEB_READY port=${actualPort}`)
+  console.log(`  Hermes Desktop Web → http://${host}:${actualPort}`)
+})

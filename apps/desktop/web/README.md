@@ -33,12 +33,18 @@ hermes desktop-web --host 127.0.0.1 --port 13043
 ```
 
 `desktop-web` builds this package with the existing Desktop workspace toolchain,
-then reuses the existing Hermes Dashboard server lifecycle with
-`HERMES_WEB_DIST` pointing at this package's `dist`. It does not launch
-Electron and does not start a separate agent implementation in the browser.
-The Dashboard server remains authoritative for authentication, profiles,
-sessions, Gateway WebSocket traffic, filesystem routes, Git routes, and agent
-execution.
+then starts its own standalone HTTP/WebSocket host on `13043` and a dedicated
+headless `hermes serve --port 0 --isolated` child backend. The child uses the
+same Hermes profile/runtime environment as native Desktop and is stopped when
+the Desktop Web host exits. Desktop Web does not launch Electron and does not
+call `hermes dashboard`; Dashboard remains a separate parallel service. The
+Desktop Web settings UI controls the connection/profile behavior exposed to the
+browser.
+
+The process sets `HERMES_DESKTOP_WEB=1`, emits `HERMES_DESKTOP_WEB_READY`, and
+uses the separate `desktop_web.public_url` configuration key (or
+`HERMES_DESKTOP_WEB_PUBLIC_URL`). It does not use Dashboard's
+`HERMES_DASHBOARD_READY` or `dashboard.public_url` identity.
 
 ## Development commands
 
