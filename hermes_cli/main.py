@@ -472,7 +472,7 @@ from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
-from hermes_cli.subcommands.gui import build_gui_parser
+from hermes_cli.subcommands.gui import build_gui_parser, build_desktop_web_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.memory import build_memory_parser
@@ -8273,6 +8273,11 @@ def cmd_gui(args: argparse.Namespace):
     if not (desktop_dir / "package.json").exists():
         print(f"Desktop GUI source not found at: {desktop_dir}")
         sys.exit(1)
+    if not (desktop_dir / "package-web.json").exists():
+        print(f"Desktop WEB source not found at: {desktop_dir}")
+        sys.exit(1)
+
+    is_desktop_web = getattr(args, "desktop_web", False)
 
     try:
         from hermes_logging import setup_logging as _setup_logging_gui
@@ -12360,7 +12365,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "gui", "desktop", "desktop-web", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy",
@@ -14628,6 +14633,11 @@ def main():
     # gui command  (parser built in hermes_cli/subcommands/gui.py)
     # =========================================================================
     build_gui_parser(subparsers, cmd_gui=cmd_gui)
+
+    # =========================================================================
+    # desktop-web command (parser built in hermes_cli/subcommands/gui.py)
+    # =========================================================================
+    build_desktop_web_parser(subparsers, cmd_gui=cmd_gui)
 
     # =========================================================================
     # logs command  (parser built in hermes_cli/subcommands/logs.py)
