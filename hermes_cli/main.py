@@ -472,7 +472,8 @@ from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
-from hermes_cli.subcommands.gui import build_gui_parser, build_desktop_web_parser
+from hermes_cli.subcommands.gui import build_gui_parser
+from hermes_cli.subcommands.gui_desktop_web import build_desktop_web_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.memory import build_memory_parser
@@ -8267,17 +8268,43 @@ def _register_linux_desktop_entry() -> None:
         print(f"⚠ Could not install the desktop launcher entry: {exc}")
 
 
+def _run_desktop_npm_command(command, *, desktop_dir: Path, env: dict[str, str]):
+    """Run npm, selecting package-web.json only for Desktop-Web."""
+    if env.get("HERMES_DESKTOP_WEB") != "1":
+        return subprocess.run(command, cwd=desktop_dir, env=env, check=False)
+
+    normal_manifest = desktop_dir / "package.json"
+    web_manifest = desktop_dir / "package-web.json"
+    backup_manifest = desktop_dir / f".package.json.desktop-web.{os.getpid()}.bak"
+    normal_manifest.replace(backup_manifest)
+    try:
+        shutil.copy2(web_manifest, normal_manifest)
+        return subprocess.run(command, cwd=desktop_dir, env=env, check=False)
+    finally:
+        try:
+            normal_manifest.unlink()
+        except FileNotFoundError:
+            pass
+        backup_manifest.replace(normal_manifest)
+
+
+def _desktop_launch_command(command, env: dict[str, str]):
+    """Add the headless display wrapper only for Desktop-Web on Linux."""
+    if env.get("HERMES_DESKTOP_WEB") != "1" or sys.platform != "linux":
+        return command
+    xvfb = shutil.which("xvfb-run")
+    if not xvfb:
+        print("✗ Desktop-Web requires xvfb-run on Linux, but it was not found on PATH.")
+        sys.exit(1)
+    return [xvfb, "-a", "-s", "-screen 0 1920x1080x24", *command]
+
+
 def cmd_gui(args: argparse.Namespace):
     """Build and launch the native Electron desktop GUI."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
     if not (desktop_dir / "package.json").exists():
         print(f"Desktop GUI source not found at: {desktop_dir}")
         sys.exit(1)
-    if not (desktop_dir / "package-web.json").exists():
-        print(f"Desktop WEB source not found at: {desktop_dir}")
-        sys.exit(1)
-
-    is_desktop_web = getattr(args, "desktop_web", False)
 
     try:
         from hermes_logging import setup_logging as _setup_logging_gui
@@ -8556,7 +8583,7 @@ def cmd_gui(args: argparse.Namespace):
 
 
 def cmd_desktop_web(args: argparse.Namespace):
-    """Build and launch the native Electron desktop GUI."""
+    """Build and launch the Electron desktop web app."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
     if not (desktop_dir / "package-web.json").exists():
         print(f"Desktop WEB source not found at: {desktop_dir}")
@@ -8572,6 +8599,9 @@ def cmd_desktop_web(args: argparse.Namespace):
 
     # with_hermes_node_path() copies os.environ when called with no arg.
     env = with_hermes_node_path()
+    env["HERMES_DESKTOP_WEB"] = "1"
+    env["HERMES_DESKTOP_WEB_HOST"] = str(getattr(args, "host", "127.0.0.1"))
+    env["HERMES_DESKTOP_WEB_PORT"] = str(getattr(args, "port", 13043))
     if getattr(args, "fake_boot", False):
         env["HERMES_DESKTOP_BOOT_FAKE"] = "1"
     if getattr(args, "ignore_existing", False):
@@ -8706,8 +8736,8 @@ def cmd_desktop_web(args: argparse.Namespace):
                 stopped = _stop_desktop_processes_locking_build(desktop_dir)
                 if stopped:
                     print(f"  ⚠ Stopped running desktop app to free the build output (pid {', '.join(map(str, stopped))})")
-            build_result = subprocess.run(
-                [npm, "run", build_script], cwd=desktop_dir, env=npm_build_env, check=False
+            build_result = _run_desktop_npm_command(
+                [npm, "run", build_script], desktop_dir=desktop_dir, env=npm_build_env,
             )
             if (
                 build_result.returncode != 0
@@ -8735,8 +8765,10 @@ def cmd_desktop_web(args: argparse.Namespace):
                     # The purge can't remove a win-unpacked tree whose Hermes.exe
                     # is still locked by a running instance; stop it before retry.
                     _stop_desktop_processes_locking_build(desktop_dir)
-                    build_result = subprocess.run(
-                        [npm, "run", build_script], cwd=desktop_dir, env=npm_build_env, check=False
+                    build_result = _run_desktop_npm_command(
+                        [npm, "run", build_script],
+                        desktop_dir=desktop_dir,
+                        env=npm_build_env,
                     )
             if (
                 build_result.returncode != 0
@@ -8753,7 +8785,11 @@ def cmd_desktop_web(args: argparse.Namespace):
                 if not _electron_dist_ok(PROJECT_ROOT):
                     _redownload_electron_dist(PROJECT_ROOT, env, mirror=mirror)
                 _stop_desktop_processes_locking_build(desktop_dir)
-                build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=mirror_env, check=False)
+                build_result = _run_desktop_npm_command(
+                    [npm, "run", build_script],
+                    desktop_dir=desktop_dir,
+                    env=mirror_env,
+                )
             if build_result.returncode != 0:
                 print("✗ Desktop GUI build failed")
                 print(f"  Run manually:  cd apps/desktop && npm run {build_script}")
@@ -8787,7 +8823,7 @@ def cmd_desktop_web(args: argparse.Namespace):
                 packaged_executable = verified_executable
 
             # Build succeeded — write the stamp so next run can skip
-            _write_desktop_build_stamp(PROJECT_ROOT, source_mode=source_mode)
+            # Do not write the normal Desktop build stamp for Web output.
 
     # Linux: register the app in the desktop launcher, so Hermes shows up
     # in the application menu with its icon. Best-effort and idempotent.
@@ -8816,7 +8852,12 @@ def cmd_desktop_web(args: argparse.Namespace):
 
     if source_mode:
         print("→ Launching Hermes Desktop from source build...")
-        launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env, check=False)
+        launch_command = _desktop_launch_command([npm, "exec", "--", "electron", "."], env)
+        launch_result = _run_desktop_npm_command(
+            launch_command,
+            desktop_dir=desktop_dir,
+            env=env,
+        )
         sys.exit(launch_result.returncode)
 
     if packaged_executable is None:
@@ -8833,6 +8874,7 @@ def cmd_desktop_web(args: argparse.Namespace):
             sys.exit(1)
 
     launch_command.extend(config_electron_flags)
+    launch_command = _desktop_launch_command(launch_command, env)
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
     launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)
     sys.exit(launch_result.returncode)
