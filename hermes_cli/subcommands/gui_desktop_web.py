@@ -10,18 +10,49 @@ import argparse
 from typing import Callable
 
 
-def build_gui_parser(subparsers, *, cmd_gui: Callable) -> None:
-    """Attach the ``gui`` subcommand to ``subparsers``."""
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "port must be an integer between 0 and 65535"
+        ) from exc
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return port
+
+
+def _host(value: str) -> str:
+    if not value or value != value.strip() or any(char.isspace() for char in value):
+        raise argparse.ArgumentTypeError(
+            "host must be a non-empty hostname or address"
+        )
+    return value
+
+
+def build_desktop_web_parser(subparsers, *, cmd_desktop_web: Callable) -> None:
+    """Attach the ``desktop-web`` subcommand to ``subparsers``."""
     # =========================================================================
     gui_parser = subparsers.add_parser(
-        "desktop",
-        aliases=["gui"],
-        help="Build and launch the native desktop app",
+        "desktop-web",
+        help="Build and launch the Electron desktop web app",
         description=(
-            "Launch the Hermes Electron desktop app. By default this installs "
-            "workspace Node dependencies, builds the current OS's unpacked "
-            "Electron app, then launches that packaged artifact."
+            "Build the Electron desktop-web application and launch it under "
+            "Xvfb on Linux. Host and port are passed to the web runtime; the "
+            "default address is http://127.0.0.1:13043."
         ),
+    )
+    gui_parser.add_argument(
+        "--host",
+        type=_host,
+        default="127.0.0.1",
+        help="Web runtime bind host (default: 127.0.0.1)",
+    )
+    gui_parser.add_argument(
+        "--port",
+        type=_port,
+        default=13043,
+        help="Web runtime bind port (default: 13043; 0 selects an OS port)",
     )
     gui_parser.add_argument(
         "--source",
@@ -31,7 +62,7 @@ def build_gui_parser(subparsers, *, cmd_gui: Callable) -> None:
     gui_parser.add_argument(
         "--build-only",
         action="store_true",
-        help="Build the desktop app but do not launch it (used by the installer's --update flow)",
+        help="Build the desktop-web app but do not launch it (used by the installer's --update flow)",
     )
     gui_parser.add_argument(
         "--fake-boot",
@@ -78,4 +109,4 @@ def build_gui_parser(subparsers, *, cmd_gui: Callable) -> None:
         default="Hermes Local Signing",
         help="Certificate name to create/use for --setup-tcc-identity (default: Hermes Local Signing)",
     )
-    gui_parser.set_defaults(func=cmd_gui)
+    gui_parser.set_defaults(func=cmd_desktop_web)
