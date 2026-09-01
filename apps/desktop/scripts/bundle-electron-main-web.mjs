@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// bundle-electron-main.mjs — bundles electron/main.ts and electron/preload.ts
+// bundle-electron-main-web.mjs — bundles electron/main-web.ts and electron/preload-web.ts
 // into self-contained js files in dist/ so the packaged app doesn't need
 // node_modules/ or tsx at runtime.
 //
 // Output:
-//   dist/electron-main.mjs    (MJS bundle — entry point for packaged app)
-//   dist/electron-preload.js (CJS bundle — loaded via BrowserWindow preload)
+//   dist/electron-main-web.mjs    (MJS bundle — entry point for packaged app)
+//   dist/electron-preload-web.js  (CJS bundle — loaded via BrowserWindow preload)
 //
 // `electron` and `node-pty` are external (provided by the runtime / staged
 // separately via stage-native-deps).
@@ -50,7 +50,7 @@ await build({
 })
 console.log(`bundled ${mainOut}${isDev ? ' (dev)' : ''}`)
 
-// Bundle preload.ts → dist/electron-preload.js
+// Bundle preload-web.ts → dist/electron-preload-web.js
 await build({
   entryPoints: [preloadEntry],
   bundle: true,
