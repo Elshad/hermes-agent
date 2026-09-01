@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, fork, spawn, type ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -280,6 +280,7 @@ import { selectPoolEvictions } from './pool-eviction'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
+import { type PreloadWebRequestContext, type PreloadWebProcessMessage } from './preload-web'
 import { PreviewReachRegistry } from './preview-reach'
 import {
   createPrimaryRemoteConnection,
@@ -438,6 +439,7 @@ import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
+import { MyIpcMain } from "./preload-web-helper";
 
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
@@ -462,6 +464,146 @@ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
 // there and Settings drops the row entirely.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
 const APP_ROOT = app.getAppPath()
+const APP_RESOURCES_PATH = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath
+
+function desktopDistArtifact(name: string): string {
+  const unpacked = APP_RESOURCES_PATH ? path.join(APP_RESOURCES_PATH, 'app.asar.unpacked', 'dist', name) : undefined
+
+  return IS_PACKAGED && unpacked && fs.existsSync(unpacked) ? unpacked : path.join(APP_ROOT, 'dist', name)
+}
+
+type PreloadWebServerAddress = { host: string; port: number }
+
+type PendingPreloadWebServerStart = {
+  resolve: (value: unknown) => void
+  reject: (error: unknown) => void
+}
+
+let preloadWebServerProcess: ChildProcess | null = null
+let preloadWebServerAddress: PreloadWebServerAddress | null = null
+let preloadWebServerStart: Promise<PreloadWebServerAddress> | null = null
+let preloadWebServerReady: PendingPreloadWebServerStart | null = null
+let ipcMainWeb: MyIpcMain | null = null
+
+function parseWebPort(value: string | undefined): number {
+  const port = Number(value)
+
+  return value !== undefined && Number.isInteger(port) && port >= 0 && port <= 65535 ? port : 13043
+}
+
+const WEB_HOST = process.env.HERMES_DESKTOP_WEB_HOST || '127.0.0.1'
+const WEB_PORT = parseWebPort(process.env.HERMES_DESKTOP_WEB_PORT)
+
+const WEB_ALLOWED_ORIGINS = (process.env.HERMES_DESKTOP_WEB_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean)
+
+const PRELOAD_WEB_SERVER_PATH = desktopDistArtifact('electron-preload-web.js')
+
+function startPreloadWebServer(): Promise<PreloadWebServerAddress> {
+  if (preloadWebServerAddress) {
+    return Promise.resolve(preloadWebServerAddress)
+  }
+
+  if (preloadWebServerStart) {
+    return preloadWebServerStart
+  }
+
+  const startPromise = new Promise<PreloadWebServerAddress>((resolve, reject) => {
+    preloadWebServerReady = { resolve, reject }
+    const child = fork(PRELOAD_WEB_SERVER_PATH, [], {
+      env: {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: '1',
+        HERMES_DESKTOP_WEB_BRIDGE_PROCESS: '1',
+        HERMES_DESKTOP_WEB_ALLOWED_ORIGINS: WEB_ALLOWED_ORIGINS.join(','),
+        HERMES_DESKTOP_WEB_HOST: WEB_HOST,
+        HERMES_DESKTOP_WEB_PORT: String(WEB_PORT)
+      },
+      execPath: process.execPath,
+      execArgv: [],
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc']
+    })
+
+    preloadWebServerProcess = child
+    ipcMainWeb = new MyIpcMain(child);
+    child.on('message', handlePreloadWebServerMessage)
+    child.once('error', error => {
+      failPreloadWebServerStart(error)
+    })
+    child.once('exit', (code, signal) => {
+      const error = new Error(`Desktop-Web web server child exited (${signal || code || 'unknown'})`)
+
+      if (!preloadWebServerAddress) {
+        failPreloadWebServerStart(error)
+      }
+
+      preloadWebServerProcess = null
+      ipcMainWeb = nil
+      preloadWebServerAddress = null
+      preloadWebServerStart = null
+    })
+  })
+
+  preloadWebServerStart = startPromise
+  return startPromise
+}
+
+function stopPreloadWebServer(): Promise<void> {
+  const child = preloadWebServerProcess
+  const error = new Error('Desktop-Web web server is shutting down')
+
+  if (!child) {
+    preloadWebServerAddress = null
+    preloadWebServerStart = null
+    failPreloadWebServerStart(error)
+    return Promise.resolve()
+  }
+
+  const requestedStop = child.connected
+
+  return new Promise(resolve => {
+    let settled = false
+    const finish = () => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      resolve()
+    }
+
+    child.once('exit', finish)
+
+    preloadWebServerProcess = null
+    ipcMainWeb = nil
+    preloadWebServerAddress = null
+    preloadWebServerStart = null
+    failPreloadWebServerStart(error)
+
+    if (requestedStop) {
+      try {
+        child.send({ type: 'stop' }, sendError => {
+          if (sendError) {
+            rememberLog(`[web-api] child IPC send failed: ${sendError.message}`)
+            child.kill()
+          }
+        })
+      } catch {
+        child.kill()
+      }
+    } else {
+      child.kill()
+    }
+
+    const timeout = setTimeout(() => {
+      child.kill()
+      finish()
+    }, 1_000)
+    timeout.unref()
+  })
+}
 
 // Device-local preference: block F12 from opening DevTools.
 // Set dynamically via IPC from the renderer Settings → Advanced.
@@ -17404,6 +17546,9 @@ app.whenReady().then(() => {
   // its worker waits for the install marker to clear, then reopens every scope
   // captured by the original transaction before removing the journal entry.
   void resumeManagedSshRecoveries()
+  void startPreloadWebServer().catch(error => {
+    rememberLog(`[web-api] failed to start: ${error?.stack || error?.message || error}`)
+  })
   createWindow()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
@@ -17499,6 +17644,8 @@ app.on('before-quit', event => {
   if (heldQuitForActiveWork(event)) {
     return
   }
+  
+  void stopPreloadWebServer()
 
   // A detached remote updater can outlive this Electron process. Do not tear
   // down its SSH observer/restore transaction at the generic SSH shutdown
