@@ -4,8 +4,9 @@
 // node_modules/ or tsx at runtime.
 //
 // Output:
-//   dist/electron-main-web.mjs    (MJS bundle — entry point for packaged app)
-//   dist/electron-preload-web.js  (CJS bundle — loaded via BrowserWindow preload)
+//   dist/electron-main-web.mjs            (MJS bundle — app entry point)
+//   dist/electron-preload-web.js          (ESM bundle — child HTTP/WebSocket server)
+//   dist/electron-preload-api-client.js   (CJS bundle — BrowserWindow preload)
 //
 // `electron` and `node-pty` are external (provided by the runtime / staged
 // separately via stage-native-deps).
@@ -23,6 +24,8 @@ const mainEntry = resolve(root, 'electron/main-web.ts')
 const mainOut = resolve(distDir, 'electron-main-web.mjs')
 const preloadEntry = resolve(root, 'electron/preload-web.ts')
 const preloadOut = resolve(distDir, 'electron-preload-web.js')
+const apiClientEntry = resolve(root, 'electron/preload-api-client.ts')
+const apiClientOut = resolve(distDir, 'electron-preload-api-client.js')
 
 const external = ['electron', 'node-pty', 'get-windows', 'fs']
 // Production bundles bake packaged=true so unpackaged `electron .` still
@@ -55,7 +58,7 @@ await build({
   entryPoints: [preloadEntry],
   bundle: true,
   platform: 'node',
-  format: 'cjs',
+  format: 'esm',
   target: 'node20',
   outfile: preloadOut,
   external,
@@ -63,3 +66,17 @@ await build({
   logLevel: 'info',
 })
 console.log(`bundled ${preloadOut}${isDev ? ' (dev)' : ''}`)
+
+// Bundle preload-api-client.ts → dist/electron-preload-api-client.js
+await build({
+  entryPoints: [apiClientEntry],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  target: 'node20',
+  outfile: apiClientOut,
+  external,
+  define,
+  logLevel: 'info'
+})
+console.log(`bundled ${apiClientOut}${isDev ? ' (dev)' : ''}`)

@@ -1,51 +1,54 @@
 /**
- * HTTP/WebSocket bridge for the browser-side `preload-api-client.ts` adapter.
+ * HTTP/WebSocket server for the browser-side `preload-api-client.ts` adapter.
  *
- * The main process supplies the two dispatch callbacks.  Keeping dispatch
- * injected avoids duplicating Electron IPC handlers and makes this module
- * usable with the existing main process without coupling it to one particular
- * handler registry.
+ * This module runs in the dedicated Desktop-Web child process. The Electron
+ * main process supplies the dispatch callbacks through the process IPC
+ * protocol below. Keeping dispatch injected avoids duplicating Electron IPC
+ * handlers and keeps this server independent from Electron.
  */
 
 import { createHash } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
+import { MyIpcRenderer } from './preload-web-helper'
+
+export const ipcRendererWeb = new MyIpcRenderer()
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_MAX_BODY_BYTES = 1 * 1024 * 1024
 const WEBSOCKET_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
-export interface PreloadBridgeContext {
+export interface PreloadWebRequestContext {
   kind: 'invoke' | 'send'
   channel: string
   args: unknown[]
-  request: IncomingMessage
+  request?: IncomingMessage
 }
 
-export interface PreloadBridgeOptions {
-  invoke: (channel: string, args: unknown[], context: PreloadBridgeContext) => unknown | Promise<unknown>
-  send: (channel: string, args: unknown[], context: PreloadBridgeContext) => unknown | Promise<unknown>
+export interface PreloadWebServerOptions {
+  invoke?: (channel: string, args: unknown[], context: PreloadWebRequestContext) => unknown | Promise<unknown>
+  send?: (channel: string, args: unknown[], context: PreloadWebRequestContext) => unknown | Promise<unknown>
   host?: string
   port?: number
   webApiPath?: string
   maxBodyBytes?: number
-  /** Explicit browser origins allowed to call the loopback HTTP bridge. */
+  /** Explicit browser origins allowed to call the loopback HTTP server. */
   allowedOrigins?: string[]
 }
 
-export interface PreloadBridgeAddress {
+export interface PreloadWebServerAddress {
   host: string
   port: number
 }
 
-export interface PreloadBridge {
+export interface PreloadWebServer {
   readonly server: Server
-  start(): Promise<PreloadBridgeAddress>
+  start(): Promise<PreloadWebServerAddress>
   stop(): Promise<void>
   emit(channel: string, ...args: unknown[]): void
 }
 
-interface BridgeRequest {
+interface WebApiRequest {
   channel: unknown
   args: unknown
 }
@@ -55,6 +58,23 @@ interface EventSocket {
   buffer: Buffer
   closed: boolean
 }
+
+export type PreloadWebProcessMessage =
+  | { type: 'ready'; host: string; port: number }
+  | { type: 'request'; id: number; kind: 'invoke' | 'send'; channel: string; args: unknown[] }
+  | {
+      type: 'response'
+      id: number
+      ok: boolean
+      result?: unknown
+      error?: { message: string; name: string; statusCode?: number }
+    }
+  | { type: 'event'; channel: string; args: unknown[] }
+  | { type: 'stop' }
+  | { type: 'fatal'; error: { message: string; name: string; statusCode?: number } }
+
+/** @deprecated Use PreloadWebProcessMessage. */
+export type PreloadWebChildMessage = PreloadWebProcessMessage
 
 function normalizePath(path: string): string {
   const trimmed = path.trim().replace(/\/+$/, '')
@@ -189,7 +209,7 @@ function websocketAccept(key: string): string {
   return createHash('sha1').update(`${key}${WEBSOCKET_GUID}`).digest('base64')
 }
 
-function readBody(request: IncomingMessage, maxBodyBytes: number): Promise<BridgeRequest> {
+function readBody(request: IncomingMessage, maxBodyBytes: number): Promise<WebApiRequest> {
   return new Promise((resolve, reject) => {
     let body = ''
     let size = 0
@@ -209,7 +229,7 @@ function readBody(request: IncomingMessage, maxBodyBytes: number): Promise<Bridg
     })
     request.once('end', () => {
       try {
-        resolve(JSON.parse(body || '{}') as BridgeRequest)
+        resolve(JSON.parse(body || '{}') as WebApiRequest)
       } catch {
         reject(Object.assign(new Error('Request body must be valid JSON'), { statusCode: 400 }))
       }
@@ -218,7 +238,7 @@ function readBody(request: IncomingMessage, maxBodyBytes: number): Promise<Bridg
   })
 }
 
-function validateRequest(payload: BridgeRequest): { channel: string; args: unknown[] } {
+function validateRequest(payload: WebApiRequest): { channel: string; args: unknown[] } {
   if (typeof payload?.channel !== 'string' || payload.channel.length === 0) {
     throw Object.assign(new Error('channel must be a non-empty string'), { statusCode: 400 })
   }
@@ -230,7 +250,7 @@ function validateRequest(payload: BridgeRequest): { channel: string; args: unkno
   return { channel: payload.channel, args: payload.args }
 }
 
-export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridge {
+export function createPreloadWebServer(options: PreloadWebServerOptions): PreloadWebServer {
   const host = options.host || DEFAULT_HOST
   const webApiPath = normalizePath(options.webApiPath || '/web-api')
   const eventsPath = `${webApiPath}/events`
@@ -239,6 +259,12 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
   const maxBodyBytes = options.maxBodyBytes || DEFAULT_MAX_BODY_BYTES
   const allowedOrigins = new Set(options.allowedOrigins || [])
   const clients = new Set<EventSocket>()
+  const invoke = options.invoke || ((channel: string, args: unknown[]) => ipcRendererWeb.invoke(channel, ...args))
+  const send =
+    options.send ||
+    ((channel: string, args: unknown[]) => {
+      ipcRendererWeb.send(channel, ...args)
+    })
 
   function allowedOrigin(request: IncomingMessage): string | undefined {
     const origin = request.headers.origin
@@ -248,9 +274,9 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
     }
 
     // Same-origin browser clients are allowed by default.  Cross-origin clients
-    // still need an explicit entry in `allowedOrigins`; this keeps the bridge
+    // still need an explicit entry in `allowedOrigins`; this keeps the web server
     // usable when the renderer is served by the same web server without making
-    // a remotely bound bridge an unrestricted cross-origin API.
+    // a remotely bound web server an unrestricted cross-origin API.
     const requestHost = request.headers.host
 
     const sameOrigin =
@@ -305,8 +331,8 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
     try {
       const payload = validateRequest(await readBody(request, maxBodyBytes))
       const kind = url.pathname === invokePath ? 'invoke' : 'send'
-      const context: PreloadBridgeContext = { kind, channel: payload.channel, args: payload.args, request }
-      const result = await options[kind](payload.channel, payload.args, context)
+      const context: PreloadWebRequestContext = { kind, channel: payload.channel, args: payload.args, request }
+      const result = await (kind === 'invoke' ? invoke : send)(payload.channel, payload.args, context)
       jsonResponse(response, 200, { ok: true, result }, responseOrigin)
     } catch (error) {
       const statusCode = typeof error === 'object' && error && 'statusCode' in error ? Number(error.statusCode) : 500
@@ -380,7 +406,7 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
           const address = server.address()
 
           if (!address || typeof address === 'string') {
-            reject(new Error('Preload bridge did not receive a TCP address'))
+            reject(new Error('Preload web server did not receive a TCP address'))
 
             return
           }
@@ -420,4 +446,107 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
       }
     }
   }
+}
+
+function childPort(): number {
+  const value = Number(process.env.HERMES_DESKTOP_WEB_PORT)
+
+  return Number.isInteger(value) && value >= 0 && value <= 65535 ? value : 13043
+}
+
+function childAllowedOrigins(): string[] {
+  return (process.env.HERMES_DESKTOP_WEB_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean)
+}
+
+const WEB_EVENT_CHANNELS = [
+  'hermes:browser-popout:closed',
+  'hermes:wake-indicator:state',
+  'hermes:pet-overlay:state',
+  'hermes:pet-overlay:control',
+  'hermes:hud:goto',
+  'hermes:hud:changed',
+  'hermes:hud:cursor',
+  'hermes:hud:game-overlay',
+  'hermes:quick-entry:state',
+  'hermes:quick-entry:submit',
+  'hermes:quick-entry:shown',
+  'hermes:connections:changed',
+  'hermes:context-menu-spellcheck',
+  'hermes:zoom:changed',
+  'hermes:close-preview-requested',
+  'hermes:preview-nav',
+  'hermes:open-folder-requested',
+  'hermes:open-updates',
+  'hermes:deep-link',
+  'hermes:window-state-changed',
+  'hermes:focus-session',
+  'hermes:notification-action',
+  'hermes:notification-activate',
+  'hermes:preview-file-changed',
+  'hermes:backend-exit',
+  'hermes:connection:applied',
+  'hermes:power-resume',
+  'hermes:power-battery',
+  'hermes:boot-progress',
+  'hermes:bootstrap:event',
+  'hermes:updates:progress',
+  'hermes:found-in-page',
+  'hermes:open-find-bar'
+] as const
+
+/** Run the HTTP/WebSocket server as a standalone child process. */
+export async function runPreloadWebServerProcess(): Promise<void> {
+  const webServer = createPreloadWebServer({
+    host: process.env.HERMES_DESKTOP_WEB_HOST || DEFAULT_HOST,
+    port: childPort(),
+    allowedOrigins: childAllowedOrigins()
+  })
+
+  for (const channel of WEB_EVENT_CHANNELS) {
+    ipcRendererWeb.on(channel, (...args) => webServer.emit(channel, ...args))
+  }
+
+  const shutdown = async (): Promise<void> => {
+    await webServer.stop()
+    process.exit(0)
+  }
+
+  process.on('message', (message: PreloadWebProcessMessage) => {
+    if (message?.type === 'stop') {
+      void shutdown()
+    }
+  })
+  process.once('disconnect', () => {
+    void shutdown()
+  })
+
+  try {
+    const address = await webServer.start()
+
+    if (typeof process.send !== 'function' || !process.connected) {
+      throw new Error('Desktop-Web server parent process is unavailable')
+    }
+
+    process.send({ type: 'ready', ...address })
+    await new Promise<void>(() => undefined)
+  } catch (error) {
+    if (typeof process.send === 'function' && process.connected) {
+      process.send({
+        type: 'fatal',
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          name: error instanceof Error ? error.name : 'Error'
+        }
+      })
+    }
+
+    throw error
+  }
+}
+
+if (process.env.HERMES_DESKTOP_WEB_BRIDGE_PROCESS === '1') {
+  void runPreloadWebServerProcess()
 }

@@ -3,9 +3,17 @@ import { once } from 'node:events'
 import { request as httpRequest } from 'node:http'
 import { connect as netConnect } from 'node:net'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { createPreloadBridge } from './preload-web'
+vi.mock('./preload-web-helper', () => ({
+  MyIpcRenderer: class {
+    invoke = vi.fn()
+    on = vi.fn()
+    send = vi.fn()
+  }
+}))
+
+import { createPreloadWebServer, ipcRendererWeb } from './preload-web'
 
 function postJson(port: number, path: string, payload: unknown, origin: string) {
   return new Promise<{ status: number; body: any }>((resolve, reject) => {
@@ -37,11 +45,11 @@ function postJson(port: number, path: string, payload: unknown, origin: string) 
   })
 }
 
-describe('preload bridge', () => {
+describe('preload web server', () => {
   it('dispatches browser invoke and send requests through the supplied handlers', async () => {
     const calls: Array<{ kind: string; channel: string; args: unknown[] }> = []
 
-    const bridge = createPreloadBridge({
+    const server = createPreloadWebServer({
       host: '127.0.0.1',
       port: 0,
       invoke: async (channel, args) => {
@@ -54,7 +62,7 @@ describe('preload bridge', () => {
       }
     })
 
-    const address = await bridge.start()
+    const address = await server.start()
 
     try {
       const origin = `http://127.0.0.1:${address.port}`
@@ -80,19 +88,40 @@ describe('preload bridge', () => {
         { kind: 'send', channel: 'hermes:test', args: [{ ok: true }] }
       ])
     } finally {
-      await bridge.stop()
+      await server.stop()
+    }
+  })
+
+  it('uses ipcRendererWeb for invoke and send requests by default', async () => {
+    const invoke = vi.spyOn(ipcRendererWeb, 'invoke').mockResolvedValue({ profile: 'work' })
+    const send = vi.spyOn(ipcRendererWeb, 'send').mockImplementation(() => undefined)
+    const server = createPreloadWebServer({ host: '127.0.0.1', port: 0 })
+    const address = await server.start()
+
+    try {
+      const origin = `http://127.0.0.1:${address.port}`
+
+      await postJson(address.port, '/web-api/invoke', { channel: 'hermes:connection', args: ['work'] }, origin)
+      await postJson(address.port, '/web-api/send', { channel: 'hermes:test', args: [{ ok: true }] }, origin)
+
+      expect(invoke).toHaveBeenCalledWith('hermes:connection', 'work')
+      expect(send).toHaveBeenCalledWith('hermes:test', { ok: true })
+    } finally {
+      invoke.mockRestore()
+      send.mockRestore()
+      await server.stop()
     }
   })
 
   it('broadcasts emitted Electron events to web clients', async () => {
-    const bridge = createPreloadBridge({
+    const server = createPreloadWebServer({
       host: '127.0.0.1',
       port: 0,
       invoke: async () => undefined,
       send: async () => undefined
     })
 
-    const address = await bridge.start()
+    const address = await server.start()
     const socket = netConnect(address.port, address.host)
 
     try {
@@ -114,7 +143,7 @@ describe('preload bridge', () => {
       const [handshakeChunk] = await once(socket, 'data')
       expect(String(handshakeChunk)).toContain('101 Switching Protocols')
 
-      bridge.emit('hermes:browser-popout:closed', 'tab-1')
+      server.emit('hermes:browser-popout:closed', 'tab-1')
       const [eventChunk] = await once(socket, 'data')
       const frame = Buffer.from(eventChunk as Buffer)
       const payloadLength = frame[1] & 0x7f
@@ -128,7 +157,7 @@ describe('preload bridge', () => {
       })
     } finally {
       socket.destroy()
-      await bridge.stop()
+      await server.stop()
     }
   })
 })

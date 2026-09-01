@@ -785,7 +785,7 @@ if (IS_WINDOWS) {
   })
 }
 
-ipcMain.handle('hermes:get-remote-display-reason', () => REMOTE_DISPLAY_REASON)
+ipcMainWeb.handle('hermes:get-remote-display-reason', () => REMOTE_DISPLAY_REASON)
 
 // Keep the renderer's PROCESS priority normal while its windows are hidden —
 // a deprioritized renderer streams a live answer visibly slower once the
@@ -6533,7 +6533,7 @@ let onBatteryPower: boolean | null = null
 
 // Renderer-side battery gating seeds from this and stays current via the
 // 'hermes:power-battery' push below.
-ipcMain.handle('hermes:power-battery:get', () => onBatteryPower === true)
+ipcMainWeb.handle('hermes:power-battery:get', () => onBatteryPower === true)
 
 function broadcastBatteryState(next: boolean) {
   if (onBatteryPower === next) {
@@ -14322,7 +14322,7 @@ function createWindow() {
   })
 }
 
-ipcMain.handle('hermes:connection', async (_event, profile) => {
+ipcMainWeb.handle('hermes:connection', async (_event, profile) => {
   // Coalesce concurrent renderer dials for one profile scope (#90812): the
   // renderer-side reconnect lock is per-window, so two windows waking at once
   // both land here. The claim key mirrors ensureBackend()'s own profile
@@ -14338,7 +14338,7 @@ ipcMain.handle('hermes:connection', async (_event, profile) => {
 // local kind delegates to ensureBackend when the v1 route is local, and
 // forces a genuinely-local child when the v1 global mode is remote (the
 // registry 'local' entry always means this machine).
-ipcMain.handle('hermes:connection:for', async (_event, payload) => {
+ipcMainWeb.handle('hermes:connection:for', async (_event, payload) => {
   const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
@@ -14353,7 +14353,7 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()
 const windowConnectionRouteOwners = new Set<number>()
 
-ipcMain.on('hermes:connection:active-route', (event, route) => {
+ipcMainWeb.on('hermes:connection:active-route', (event, route) => {
   const id = event.sender.id
   const previous = windowConnectionRoutes.get(id)
   const next = windowConnectionRoutes.set(id, route)
@@ -14383,7 +14383,7 @@ ipcMain.on('hermes:connection:active-route', (event, route) => {
 // to confirm the cached PRIMARY backend is still reachable; if a remote one is
 // not, we drop the cache so the next getConnection() rebuilds it. Local backends
 // self-heal via their child 'exit' handler, so we never touch them here.
-ipcMain.handle('hermes:connection:revalidate', async () => {
+ipcMainWeb.handle('hermes:connection:revalidate', async () => {
   const connectionPromise = backendConnectionState.getPromise()
 
   if (!connectionPromise) {
@@ -14482,15 +14482,15 @@ function revalidateSuspectPoolAfterResume() {
   )
 }
 
-ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
+ipcMainWeb.handle('hermes:backend:touch', async (_event, profile) => {
   touchPoolBackend(profile)
 
   return { ok: true }
 })
-ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => {
+ipcMainWeb.handle('hermes:gateway:ws-url', async (_event, profile) => {
   return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile))
 })
-ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
+ipcMainWeb.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
     return { ok: false, error: 'invalid-session-id' }
   }
@@ -14499,12 +14499,12 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:window:openInstance', async () => {
+ipcMainWeb.handle('hermes:window:openInstance', async () => {
   createInstanceWindow()
 
   return { ok: true }
 })
-ipcMain.handle('hermes:window:openBrowser', async (_event, tabId) => {
+ipcMainWeb.handle('hermes:window:openBrowser', async (_event, tabId) => {
   if (typeof tabId !== 'string' || !tabId.trim()) {
     return { ok: false, error: 'invalid-tab-id' }
   }
@@ -14524,7 +14524,7 @@ ipcMain.handle('hermes:window:openBrowser', async (_event, tabId) => {
 // hoping a `hermes` exists on the user's interactive PATH. Resolution only —
 // never ensureRuntime(), which would kick off a first-run install from a menu
 // click; an unresolved runtime is reported instead.
-ipcMain.handle('hermes:window:openInTerminal', async (_event, sessionId, opts) => {
+ipcMainWeb.handle('hermes:window:openInTerminal', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
     return { ok: false, error: 'invalid-session-id' }
   }
@@ -14577,22 +14577,22 @@ ipcMain.handle('hermes:window:openInTerminal', async (_event, sessionId, opts) =
     return { ok: false, error: error.message }
   }
 })
-ipcMain.handle('hermes:wake-indicator:get', () => wakeIndicatorController.getState())
-ipcMain.on('hermes:wake-indicator:set', (_event, state) => {
+ipcMainWeb.handle('hermes:wake-indicator:get', () => wakeIndicatorController.getState())
+ipcMainWeb.on('hermes:wake-indicator:set', (_event, state) => {
   wakeIndicatorController.setState(state)
 })
 
 // --- Text size (zoom) -------------------------------------------------------
 // The settings UI drives the same clamped zoom scale as the Ctrl/Cmd
 // shortcuts and the View menu. Reads and writes target the asking window.
-ipcMain.handle('hermes:zoom:get', event => {
+ipcMainWeb.handle('hermes:zoom:get', event => {
   const window = BrowserWindow.fromWebContents(event.sender)
 
   const level = window && !window.isDestroyed() ? window.webContents.getZoomLevel() : DEFAULT_ZOOM_LEVEL
 
   return { level, percent: zoomLevelToPercent(level) }
 })
-ipcMain.on('hermes:zoom:set-percent', (event, percent) => {
+ipcMainWeb.on('hermes:zoom:set-percent', (event, percent) => {
   const window = BrowserWindow.fromWebContents(event.sender)
 
   if (!window || window.isDestroyed()) {
@@ -14623,7 +14623,7 @@ const hudIpc = registerHudIpc({
   }
 })
 
-ipcMain.handle('hermes:bootstrap:reset', async () => {
+ipcMainWeb.handle('hermes:bootstrap:reset', async () => {
   // Renderer's "Reload and retry" path. Clear the latched failure and
   // reset connection state so the next startHermes() call restarts the
   // full backend flow (including a fresh runBootstrap pass).
@@ -14637,7 +14637,7 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:bootstrap:repair', async () => {
+ipcMainWeb.handle('hermes:bootstrap:repair', async () => {
   // Forceful repair: force the next startHermes() through the full installer
   // (refreshing a broken/partial venv) and clear any latched failure + live
   // connection. The renderer reloads afterwards to re-drive the boot flow.
@@ -14689,13 +14689,13 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:bootstrap:continue-local', async () => {
+ipcMainWeb.handle('hermes:bootstrap:continue-local', async () => {
   rememberLog('[bootstrap] local install selected by renderer; continuing first-launch bootstrap')
   continueFirstRunLocalBootstrap()
 
   return { ok: true }
 })
-ipcMain.handle('hermes:bootstrap:cancel', async () => {
+ipcMainWeb.handle('hermes:bootstrap:cancel', async () => {
   // Renderer's Cancel button during first-launch install. Abort the running
   // install script (SIGTERM via the runner's abortSignal). runBootstrap
   // resolves with { cancelled: true }, which surfaces the recovery overlay.
@@ -14711,12 +14711,12 @@ ipcMain.handle('hermes:bootstrap:cancel', async () => {
 
   return { ok: false, cancelled: false }
 })
-ipcMain.handle('hermes:boot-progress:get', async () => bootProgressState)
-ipcMain.handle('hermes:bootstrap:get', async () => getBootstrapState())
-ipcMain.handle('hermes:connection-config:get', async (_event, profile) =>
+ipcMainWeb.handle('hermes:boot-progress:get', async () => bootProgressState)
+ipcMainWeb.handle('hermes:bootstrap:get', async () => getBootstrapState())
+ipcMainWeb.handle('hermes:connection-config:get', async (_event, profile) =>
   sanitizeDesktopConnectionConfig(readDesktopConnectionConfig(), profile)
 )
-ipcMain.handle('hermes:plugin-profile-routes', async (_event, rawProfileNames) => {
+ipcMainWeb.handle('hermes:plugin-profile-routes', async (_event, rawProfileNames) => {
   const fallbackProfileNames = Array.isArray(rawProfileNames)
     ? rawProfileNames
         .filter(name => typeof name === 'string')
@@ -14784,8 +14784,8 @@ ipcMain.handle('hermes:plugin-profile-routes', async (_event, rawProfileNames) =
 
   return buildRegistryProfileRoutes({ agents, sources: registry.connections })
 })
-ipcMain.handle('hermes:ssh-config:hosts', async () => ({ hosts: collectSshConfigHosts() }))
-ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
+ipcMainWeb.handle('hermes:ssh-config:hosts', async () => ({ hosts: collectSshConfigHosts() }))
+ipcMainWeb.handle('hermes:ssh-config:resolve', async (_event, host) => {
   const value = String(host || '').trim()
 
   if (!value) {
@@ -14828,25 +14828,25 @@ ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
     })
   })
 })
-ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testDesktopConnectionConfig(payload))
+ipcMainWeb.handle('hermes:connection-config:test', async (_event, payload) => testDesktopConnectionConfig(payload))
 
 // ── Opt-in keychain encryption for stored secrets ───────────────────────────
 // get returns the current policy without touching safeStorage; set flips it
 // and re-encodes every stored secret (see applySecretStorageEncryption).
-ipcMain.handle('hermes:secret-storage:get', async () => ({ on: secretStoragePolicy().on }))
-ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => applySecretStorageEncryption(on === true))
+ipcMainWeb.handle('hermes:secret-storage:get', async () => ({ on: secretStoragePolicy().on }))
+ipcMainWeb.handle('hermes:secret-storage:set', async (_event: any, on: any) => applySecretStorageEncryption(on === true))
 
 // ── v2 connection registry IPC (multi-source) ───────────────────────────────
 // Storage-level CRUD for named agent sources. Routing/pooling consumption of
 // the registry lands separately; these handlers only manage the persisted
 // list, so they are safe to ship ahead of the switchover.
-ipcMain.handle('hermes:connections:list', async () => sanitizeConnectionsRegistry())
-ipcMain.handle('hermes:connections:save', async (_event, payload) => {
+ipcMainWeb.handle('hermes:connections:list', async () => sanitizeConnectionsRegistry())
+ipcMainWeb.handle('hermes:connections:save', async (_event, payload) => {
   const saved = await saveRegistryConnection(payload)
 
   return { ok: true, connection: saved, registry: sanitizeConnectionsRegistry() }
 })
-ipcMain.handle('hermes:connections:remove', async (_event, id) => {
+ipcMainWeb.handle('hermes:connections:remove', async (_event, id) => {
   const key = String(id || '')
   managedConnectionUpdateGate.assertCanMutate(key)
   const registry = removeConnection(readDesktopConnectionsRegistry(), key)
@@ -14861,27 +14861,27 @@ ipcMain.handle('hermes:connections:remove', async (_event, id) => {
 
   return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
 })
-ipcMain.handle('hermes:connections:set-primary', async (_event, id) => {
+ipcMainWeb.handle('hermes:connections:set-primary', async (_event, id) => {
   assertCanMutateManagedPrimaryRouting()
   const registry = setPrimaryConnection(readDesktopConnectionsRegistry(), String(id || ''))
   writeDesktopConnectionsRegistry(registry)
 
   return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
 })
-ipcMain.handle('hermes:connections:set-launch-mode', async (_event, mode) => {
+ipcMainWeb.handle('hermes:connections:set-launch-mode', async (_event, mode) => {
   assertCanMutateManagedPrimaryRouting()
   const registry = setConnectionLaunchMode(readDesktopConnectionsRegistry(), String(mode || ''))
   writeDesktopConnectionsRegistry(registry)
 
   return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
 })
-ipcMain.handle('hermes:connections:set-last-used', async (_event, id) => {
+ipcMainWeb.handle('hermes:connections:set-last-used', async (_event, id) => {
   const registry = setLastUsedConnection(readDesktopConnectionsRegistry(), String(id || ''))
   writeDesktopConnectionsRegistry(registry)
 
   return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
 })
-ipcMain.handle('hermes:connections:test', async (_event, id) => {
+ipcMainWeb.handle('hermes:connections:test', async (_event, id) => {
   const registry = readDesktopConnectionsRegistry()
   const entry = registry.connections.find(c => c.id === String(id || ''))
 
@@ -15227,7 +15227,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
   )
 }
 
-ipcMain.handle('hermes:agents:roster', async () => {
+ipcMainWeb.handle('hermes:agents:roster', async () => {
   const registry = readDesktopConnectionsRegistry()
   const enumerations = await enumerateRegistryAgentSources(registry)
 
@@ -15259,7 +15259,7 @@ const registryGatewayWsUrlHandler = createRegistryGatewayWsUrlHandler({
   rememberHeaders: rememberRemoteWsHeaders
 })
 
-ipcMain.handle('hermes:gateway:ws-url-for', async (_event, payload) => {
+ipcMainWeb.handle('hermes:gateway:ws-url-for', async (_event, payload) => {
   return gatewayWsUrlIpcResult(() => registryGatewayWsUrlHandler(payload))
 })
 
@@ -15311,14 +15311,14 @@ async function requestManagedSshUpdate(rawId) {
   return operation
 }
 
-ipcMain.handle('hermes:connections:update-managed', async (_event, rawId) => requestManagedSshUpdate(rawId))
+ipcMainWeb.handle('hermes:connections:update-managed', async (_event, rawId) => requestManagedSshUpdate(rawId))
 
 // Fan out `hermes update` to every eligible registered connection at once.
 // Cloud entries are excluded (platform-managed); each dispatch reports
 // independently so one dead LAN box can't wedge the batch. Local reuses the
 // app's own update pipeline; Desktop-managed SSH uses the transactional
 // drain/update/restore lifecycle; URL remotes POST their backend updater.
-ipcMain.handle('hermes:connections:update-all', async (_event, payload) => {
+ipcMainWeb.handle('hermes:connections:update-all', async (_event, payload) => {
   const registry = readDesktopConnectionsRegistry()
 
   // Optional renderer-side exclusions: the everything-update flow dispatches
@@ -15451,8 +15451,8 @@ async function fetchJsonForBackend(
   })
 }
 
-ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
-ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => {
+ipcMainWeb.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
+ipcMainWeb.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => {
   // Capability-gated login (RFC 8252). Probe the gateway's public /api/status
   // for supported auth_flows and /api/auth/providers for provider capabilities:
   //   - all providers support password → always use the embedded login window
@@ -15515,7 +15515,7 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
 
   return { ok: true, baseUrl, connected }
 })
-ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
+ipcMainWeb.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
   await clearOauthSession(baseUrl)
 
@@ -15534,39 +15534,39 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) =
 // --- Hermes Cloud (cloud-auto-discovery Phase 3) ---
 // One portal login in the OAuth partition powers both discovery and the silent
 // per-agent cascade. See the discovery/cascade helpers above.
-ipcMain.handle('hermes:cloud:status', async () => ({
+ipcMainWeb.handle('hermes:cloud:status', async () => ({
   portalBaseUrl: resolvePortalBaseUrl(),
   signedIn: await hasLivePortalSession()
 }))
-ipcMain.handle('hermes:cloud:login', async () => {
+ipcMainWeb.handle('hermes:cloud:login', async () => {
   await openPortalLoginWindow()
 
   return { ok: true, signedIn: await hasLivePortalSession() }
 })
-ipcMain.handle('hermes:cloud:logout', async () => {
+ipcMainWeb.handle('hermes:cloud:logout', async () => {
   await clearOauthSession(resolvePortalBaseUrl())
 
   return { ok: true, signedIn: await hasLivePortalSession() }
 })
-ipcMain.handle('hermes:cloud:discover', async (_event, org) => {
+ipcMainWeb.handle('hermes:cloud:discover', async (_event, org) => {
   // Returns { agents } or { needsOrgSelection: true, orgs }. `org` (optional)
   // scopes discovery to a chosen org for multi-org users.
   return discoverCloudAgents(typeof org === 'string' && org ? org : undefined)
 })
-ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl) => {
+ipcMainWeb.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl) => {
   // Silent per-agent sign-in via the shared portal session. Returns the agent's
   // gateway baseUrl + whether its session cookie landed; the renderer then
   // saves a cloud-mode connection pointed at this dashboardUrl.
   return cloudAgentSilentSignIn(dashboardUrl)
 })
-ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
+ipcMainWeb.handle('hermes:connection-config:save', async (_event, payload) => {
   assertCanMutateManagedPrimaryRouting()
   const config = coerceDesktopConnectionConfig(payload)
   writeDesktopConnectionConfig(config)
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
-ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
+ipcMainWeb.handle('hermes:connection-config:apply', async (_event, payload) => {
   assertCanMutateManagedPrimaryRouting()
   const previousConfig = readDesktopConnectionConfig()
   const previousRegistry = readDesktopConnectionsRegistry()
@@ -15614,15 +15614,15 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 
-ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
+ipcMainWeb.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
 // Persistence-only sibling of hermes:profile:set: records the profile the
 // Desktop should boot into next launch WITHOUT tearing down the backend or
 // reloading the window — the rail's live workspace switch already re-homed
 // the gateway (#79886).
-ipcMain.handle('hermes:profile:remember', async (_event, name) => ({
+ipcMainWeb.handle('hermes:profile:remember', async (_event, name) => ({
   profile: writeActiveDesktopProfile(name)
 }))
-ipcMain.handle('hermes:profile:set', async (_event, name) => {
+ipcMainWeb.handle('hermes:profile:set', async (_event, name) => {
   assertCanMutateManagedPrimaryRouting()
   const next = writeActiveDesktopProfile(name)
 
@@ -15635,11 +15635,11 @@ ipcMain.handle('hermes:profile:set', async (_event, name) => {
   return { profile: next }
 })
 
-ipcMain.on('hermes:previewShortcutActive', (_event, active) => {
+ipcMainWeb.on('hermes:previewShortcutActive', (_event, active) => {
   previewShortcutActive = Boolean(active)
 })
 
-ipcMain.handle('hermes:requestMicrophoneAccess', async () => {
+ipcMainWeb.handle('hermes:requestMicrophoneAccess', async () => {
   if (!IS_MAC || typeof systemPreferences.askForMediaAccess !== 'function') {
     return true
   }
@@ -15651,7 +15651,7 @@ ipcMain.handle('hermes:requestMicrophoneAccess', async () => {
 // Metadata only (app, title, bounds) — never pixels. On macOS, other apps'
 // window titles are gated behind the Screen Recording permission; pass titles
 // through only when it is ALREADY granted, and never prompt for it here.
-ipcMain.handle('hermes:window:readBelow', async event => {
+ipcMainWeb.handle('hermes:window:readBelow', async event => {
   const win = BrowserWindow.fromWebContents(event.sender)
 
   if (!win || win.isDestroyed()) {
@@ -16164,7 +16164,7 @@ async function handleHermesApiRequest(request) {
   return response
 }
 
-ipcMain.handle('hermes:api', async (_event, request) => {
+ipcMainWeb.handle('hermes:api', async (_event, request) => {
   // Hold the deletion gate for BOTH profile deletes and renames: a concurrent
   // renderer reconnect entering ensureBackend() mid-mutation would otherwise
   // respawn the old-name backend and recreate its HERMES_HOME (#45474).
@@ -16201,9 +16201,9 @@ const claimedAmbientCue = createEventDeduper()
 
 // A window asks "do I own this ambient cue (turn-end sound / spoken reply)?".
 // The first caller within the window gets true; peers get false and stay quiet.
-ipcMain.handle('hermes:ambient:claim', (_event, key) => !claimedAmbientCue(String(key ?? '')))
+ipcMainWeb.handle('hermes:ambient:claim', (_event, key) => !claimedAmbientCue(String(key ?? '')))
 
-ipcMain.handle('hermes:notify', (_event, payload) => {
+ipcMainWeb.handle('hermes:notify', (_event, payload) => {
   if (!Notification.isSupported()) {
     return false
   }
@@ -16311,14 +16311,14 @@ function persistDataUrlReadMaxMb(maxMb) {
   return next
 }
 
-ipcMain.handle('hermes:data-url-read-max:get', () => ({
+ipcMainWeb.handle('hermes:data-url-read-max:get', () => ({
   maxMb: dataUrlReadMaxMb,
   // Keep the default bytes constant visible for tests / diagnostics.
   defaultMaxMb: DATA_URL_READ_DEFAULT_MAX_MB,
   maxBytes: dataUrlReadMaxBytesFromMb(dataUrlReadMaxMb)
 }))
 
-ipcMain.handle('hermes:data-url-read-max:set', (_event, maxMb) => {
+ipcMainWeb.handle('hermes:data-url-read-max:set', (_event, maxMb) => {
   const next = persistDataUrlReadMaxMb(maxMb)
 
   return {
@@ -16328,7 +16328,7 @@ ipcMain.handle('hermes:data-url-read-max:set', (_event, maxMb) => {
   }
 })
 
-ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
+ipcMainWeb.handle('hermes:readFileDataUrl', async (_event, filePath) => {
   return readFileDataUrlForIpc(filePath, {
     maxBytes: dataUrlReadMaxBytesFromMb(dataUrlReadMaxMb),
     mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'File preview' })),
@@ -16340,7 +16340,7 @@ ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
 // Keep a finite cap so Electron + base64 memory stays bounded while archives
 // can exceed the default 16 MiB preview ceiling (and still fit the gateway
 // WebSocket frame limit after base64 expansion).
-ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
+ipcMainWeb.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
   return readFileDataUrlForIpc(filePath, {
     maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
     mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
@@ -16348,7 +16348,7 @@ ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
   })
 })
 
-ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
+ipcMainWeb.handle('hermes:readFileText', async (_event, filePath) => {
   const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
     maxBytes: TEXT_PREVIEW_SOURCE_MAX_BYTES,
     purpose: 'Text preview'
@@ -16383,7 +16383,7 @@ ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
 // instead of truncation when the source exceeds it.
 const PLUGIN_SOURCE_MAX_BYTES = 16 * 1024 * 1024
 
-ipcMain.handle('hermes:readPluginSource', async (_event: unknown, filePath: unknown) => {
+ipcMainWeb.handle('hermes:readPluginSource', async (_event: unknown, filePath: unknown) => {
   const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
     maxBytes: PLUGIN_SOURCE_MAX_BYTES,
     purpose: 'Plugin source'
@@ -16397,7 +16397,7 @@ ipcMain.handle('hermes:readPluginSource', async (_event: unknown, filePath: unkn
   }
 })
 
-ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
+ipcMainWeb.handle('hermes:selectPaths', async (_event, options: any = {}) => {
   const properties = options?.directories ? ['openDirectory'] : ['openFile']
 
   if (options?.multiple !== false) {
@@ -16434,7 +16434,7 @@ ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
   return result.filePaths
 })
 
-ipcMain.handle('hermes:writeClipboard', (_event, text) => {
+ipcMainWeb.handle('hermes:writeClipboard', (_event, text) => {
   clipboard.writeText(String(text || ''))
 
   return true
@@ -16442,7 +16442,7 @@ ipcMain.handle('hermes:writeClipboard', (_event, text) => {
 
 // Native save-location picker (profile export etc.) — the write itself happens
 // elsewhere (the backend, for profile archives); this only picks the path.
-ipcMain.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
+ipcMainWeb.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
   const result = await dialog.showSaveDialog(mainWindow, {
     title: options?.title || 'Save',
     defaultPath: options?.defaultPath ? String(options.defaultPath) : undefined,
@@ -16460,15 +16460,15 @@ ipcMain.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
 // navigator.clipboard.readText() throws "Document is not focused" whenever a
 // portaled overlay has focus, and there's no way to route a read through the
 // canvas. The main process has no such gate.
-ipcMain.handle('hermes:readClipboard', () => clipboard.readText())
+ipcMainWeb.handle('hermes:readClipboard', () => clipboard.readText())
 
-ipcMain.handle('hermes:saveGatewayFile', (_event, payload) => saveGatewayFile(payload))
+ipcMainWeb.handle('hermes:saveGatewayFile', (_event, payload) => saveGatewayFile(payload))
 
-ipcMain.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
+ipcMainWeb.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
 
 // The custom context menu's edit verbs. They act on the SENDER's focused
 // element, so the renderer restores focus to the editable before invoking.
-ipcMain.handle('hermes:context-menu:edit', (event, command) => {
+ipcMainWeb.handle('hermes:context-menu:edit', (event, command) => {
   const contents = event.sender
 
   if (command === 'copy') {
@@ -16484,7 +16484,7 @@ ipcMain.handle('hermes:context-menu:edit', (event, command) => {
 
 // Copy the image under the sender's LAST context-menu gesture. Chromium only
 // exposes image bytes through copyImageAt, and only main saw the coordinates.
-ipcMain.handle('hermes:context-menu:copy-image', event => {
+ipcMainWeb.handle('hermes:context-menu:copy-image', event => {
   const point = lastContextMenuPoint.get(event.sender.id)
 
   if (point) {
@@ -16492,7 +16492,7 @@ ipcMain.handle('hermes:context-menu:copy-image', event => {
   }
 })
 
-ipcMain.handle('hermes:context-menu:spellcheck', (event, action) => {
+ipcMainWeb.handle('hermes:context-menu:spellcheck', (event, action) => {
   const kind = action?.kind
   const word = String(action?.word || '')
 
@@ -16509,7 +16509,7 @@ ipcMain.handle('hermes:context-menu:spellcheck', (event, action) => {
 
 // Guest dictionary add: the webview TAG exposes replaceMisspelling but no
 // session API, so the renderer names the guest by webContents id.
-ipcMain.handle('hermes:context-menu:guest-add-word', (_event, payload) => {
+ipcMainWeb.handle('hermes:context-menu:guest-add-word', (_event, payload) => {
   const word = String(payload?.word || '')
   const guest = electronWebContents.fromId(Number(payload?.webContentsId))
 
@@ -16518,7 +16518,7 @@ ipcMain.handle('hermes:context-menu:guest-add-word', (_event, payload) => {
   }
 })
 
-ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
+ipcMainWeb.handle('hermes:saveImageBuffer', async (_event, payload) => {
   const data = payload?.data
 
   if (!data) {
@@ -16530,7 +16530,7 @@ ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
   return writeComposerImage(buffer, payload?.ext || '.png')
 })
 
-ipcMain.handle('hermes:saveClipboardImage', async () => {
+ipcMainWeb.handle('hermes:saveClipboardImage', async () => {
   const image = clipboard.readImage()
 
   if (image && !image.isEmpty()) {
@@ -16551,15 +16551,15 @@ ipcMain.handle('hermes:saveClipboardImage', async () => {
   return ''
 })
 
-ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
+ipcMainWeb.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
   normalizePreviewTarget(String(target || ''), baseDir ? String(baseDir) : '')
 )
 
-ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(String(url || '')))
+ipcMainWeb.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(String(url || '')))
 
-ipcMain.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(dir || '')))
+ipcMainWeb.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(dir || '')))
 
-ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
+ipcMainWeb.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 
 // Each renderer reports the turns it has in flight; the quit guard reads the
 // merged picture. Keyed by webContents id so a closed window stops counting.
@@ -16574,7 +16574,7 @@ function updateStreamThrottleFromActiveWork() {
   streamThrottle.update(mergeActiveWork(activeWorkByWebContents.values()).count > 0)
 }
 
-ipcMain.on('hermes:active-work', (event, payload) => {
+ipcMainWeb.on('hermes:active-work', (event, payload) => {
   const id = event.sender.id
 
   if (!activeWorkByWebContents.has(id)) {
@@ -16588,7 +16588,7 @@ ipcMain.on('hermes:active-work', (event, payload) => {
   updateStreamThrottleFromActiveWork()
 })
 
-ipcMain.on('hermes:titlebar-theme', (_event, payload) => {
+ipcMainWeb.on('hermes:titlebar-theme', (_event, payload) => {
   if (!payload || !isHexColor(payload.background) || !isHexColor(payload.foreground)) {
     return
   }
@@ -16607,7 +16607,7 @@ ipcMain.on('hermes:titlebar-theme', (_event, payload) => {
 })
 
 // Pin the native appearance to the app theme (see NATIVE_THEME_CONFIG_PATH).
-ipcMain.on('hermes:native-theme', (_event, mode) => {
+ipcMainWeb.on('hermes:native-theme', (_event, mode) => {
   if (!THEME_SOURCES.has(mode)) {
     return
   }
@@ -16660,11 +16660,11 @@ app.on('will-quit', () => {
 // Answered synchronously so preload can publish the verdict before the
 // renderer's first script — see the note there on why it cannot decide this
 // itself. Registered at module scope, which runs long before any window.
-ipcMain.on('hermes:translucency:support', event => {
+ipcMainWeb.on('hermes:translucency:support', event => {
   event.returnValue = { glass: GLASS_SUPPORTED, translucency: TRANSLUCENCY_SUPPORTED }
 })
 
-ipcMain.on('hermes:translucency', (_event, payload) => {
+ipcMainWeb.on('hermes:translucency', (_event, payload) => {
   const next = normalizeTranslucency(payload, GLASS_SUPPORTED)
   const previous = translucencyState
 
@@ -16719,7 +16719,7 @@ function readPersistedKeepAwake() {
   }
 }
 
-ipcMain.on('hermes:keep-awake', (_event, on) => {
+ipcMainWeb.on('hermes:keep-awake', (_event, on) => {
   const enabled = Boolean(on)
   keepAwake.set(enabled)
 
@@ -16736,7 +16736,7 @@ ipcMain.on('hermes:keep-awake', (_event, on) => {
 // accelerator — so both handlers return the state that ACTUALLY resulted,
 // including `registered: false` + `error: 'taken'` when another app owns the
 // chord. See electron/quick-entry.ts + store/quick-entry.
-ipcMain.handle('hermes:quick-entry:settings:get', async () => {
+ipcMainWeb.handle('hermes:quick-entry:settings:get', async () => {
   const settings = readQuickEntrySettings()
   const state = quickEntryShortcut.current()
 
@@ -16750,7 +16750,7 @@ ipcMain.handle('hermes:quick-entry:settings:get', async () => {
   }
 })
 
-ipcMain.handle('hermes:quick-entry:settings:set', async (_event, patch) => {
+ipcMainWeb.handle('hermes:quick-entry:settings:set', async (_event, patch) => {
   const current = readQuickEntrySettings()
 
   const next = sanitizeQuickEntrySettings({
@@ -16767,7 +16767,7 @@ ipcMain.handle('hermes:quick-entry:settings:set', async (_event, patch) => {
 // owns the one prompt-submit path, and forwarding keeps it that way. The
 // payload is `{ target, text }` — target routing (current chat / a picked
 // session / new) is the renderer's job too.
-ipcMain.on('hermes:quick-entry:submit', (_event, payload) => {
+ipcMainWeb.on('hermes:quick-entry:submit', (_event, payload) => {
   hideQuickEntryWindow()
 
   const text = typeof payload?.text === 'string' ? payload.text.trim() : ''
@@ -16793,7 +16793,7 @@ ipcMain.on('hermes:quick-entry:submit', (_event, payload) => {
 // Primary renderer → main → quick window: gateway connection state + the
 // recent-session list for the target picker. Cached so a quick window spawned
 // AFTER the last push still boots from truth instead of "disconnected".
-ipcMain.on('hermes:quick-entry:state', (_event, payload) => {
+ipcMainWeb.on('hermes:quick-entry:state', (_event, payload) => {
   quickEntryLastState = payload ?? null
 
   if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
@@ -16801,7 +16801,7 @@ ipcMain.on('hermes:quick-entry:state', (_event, payload) => {
   }
 })
 
-ipcMain.on('hermes:quick-entry:dismiss', () => hideQuickEntryWindow())
+ipcMainWeb.on('hermes:quick-entry:dismiss', () => hideQuickEntryWindow())
 
 // Disable F12 DevTools: maintained in the main process so a cold launch
 // restores it before any window is shown (applied on ready). The renderer
@@ -16816,7 +16816,7 @@ function readPersistedDisableF12() {
   }
 }
 
-ipcMain.on('hermes:devtools:disable-f12', (_event, on) => {
+ipcMainWeb.on('hermes:devtools:disable-f12', (_event, on) => {
   f12Blocked = Boolean(on)
 
   try {
@@ -16827,7 +16827,7 @@ ipcMain.on('hermes:devtools:disable-f12', (_event, on) => {
   }
 })
 
-ipcMain.handle('hermes:openExternal', (_event, url) => {
+ipcMainWeb.handle('hermes:openExternal', (_event, url) => {
   if (!openExternalUrl(url)) {
     throw new Error('Invalid external URL')
   }
@@ -16862,7 +16862,7 @@ function ensureFoundInPageForwarder(sender: Electron.WebContents): void {
   })
 }
 
-ipcMain.handle('hermes:find-in-page', async (event, query, options) => {
+ipcMainWeb.handle('hermes:find-in-page', async (event, query, options) => {
   const win = BrowserWindow.fromWebContents(event.sender)
 
   if (!win || win.isDestroyed()) {
@@ -16877,7 +16877,7 @@ ipcMain.handle('hermes:find-in-page', async (event, query, options) => {
   return { count: 0 }
 })
 
-ipcMain.handle('hermes:stop-find-in-page', event => {
+ipcMainWeb.handle('hermes:stop-find-in-page', event => {
   const win = BrowserWindow.fromWebContents(event.sender)
 
   if (!win || win.isDestroyed()) {
@@ -16889,9 +16889,9 @@ ipcMain.handle('hermes:stop-find-in-page', event => {
 
 // The renderer can't know whether a loopback URL is reachable — only main
 // knows which transport backs this gateway. Ask before loading one.
-ipcMain.handle('hermes:preview:reach', async (event, url) => reachablePreviewUrl(event.sender.id, String(url || '')))
+ipcMainWeb.handle('hermes:preview:reach', async (event, url) => reachablePreviewUrl(event.sender.id, String(url || '')))
 
-ipcMain.handle('hermes:openPreviewInBrowser', async (_event, url) => {
+ipcMainWeb.handle('hermes:openPreviewInBrowser', async (_event, url) => {
   if (!(await openPreviewInBrowser(url))) {
     throw new Error('Invalid preview URL')
   }
@@ -16901,15 +16901,15 @@ ipcMain.handle('hermes:openPreviewInBrowser', async (_event, url) => {
 // settings mount and seeds the value into the picker; writing back persists
 // it via writeDefaultProjectDir so resolveHermesCwd picks it up on the next
 // session spawn (no app restart needed).
-ipcMain.handle('hermes:setting:defaultProjectDir:get', async () => ({
+ipcMainWeb.handle('hermes:setting:defaultProjectDir:get', async () => ({
   dir: readDefaultProjectDir(),
   defaultLabel: app.getPath('home'),
   resolvedCwd: resolveHermesCwd()
 }))
 
-ipcMain.handle('hermes:workspace:sanitize', async (_event, cwd) => sanitizeWorkspaceCwd(cwd))
+ipcMainWeb.handle('hermes:workspace:sanitize', async (_event, cwd) => sanitizeWorkspaceCwd(cwd))
 
-ipcMain.handle('hermes:setting:defaultProjectDir:set', async (_event, dir) => {
+ipcMainWeb.handle('hermes:setting:defaultProjectDir:set', async (_event, dir) => {
   const next = typeof dir === 'string' && dir.trim() ? dir.trim() : null
 
   if (next) {
@@ -16925,7 +16925,7 @@ ipcMain.handle('hermes:setting:defaultProjectDir:set', async (_event, dir) => {
   return { dir: next }
 })
 
-ipcMain.handle('hermes:setting:defaultProjectDir:pick', async () => {
+ipcMainWeb.handle('hermes:setting:defaultProjectDir:pick', async () => {
   const result = await dialog.showOpenDialog({
     title: 'Choose default project directory',
     properties: ['openDirectory', 'createDirectory'],
@@ -16939,11 +16939,11 @@ ipcMain.handle('hermes:setting:defaultProjectDir:pick', async () => {
   return { canceled: false, dir: result.filePaths[0] }
 })
 
-ipcMain.handle('hermes:fetchLinkTitle', (_event, url) => fetchLinkTitle(url))
+ipcMainWeb.handle('hermes:fetchLinkTitle', (_event, url) => fetchLinkTitle(url))
 
-ipcMain.handle('hermes:resolveFavicon', (_event, url) => resolveFaviconCached(url))
+ipcMainWeb.handle('hermes:resolveFavicon', (_event, url) => resolveFaviconCached(url))
 
-ipcMain.handle('hermes:logs:reveal', async () => {
+ipcMainWeb.handle('hermes:logs:reveal', async () => {
   try {
     await fs.promises.mkdir(path.dirname(DESKTOP_LOG_PATH), { recursive: true })
 
@@ -16959,14 +16959,14 @@ ipcMain.handle('hermes:logs:reveal', async () => {
   }
 })
 
-ipcMain.handle('hermes:logs:recent', async () => ({ path: DESKTOP_LOG_PATH, lines: hermesLog.slice(-200) }))
+ipcMainWeb.handle('hermes:logs:recent', async () => ({ path: DESKTOP_LOG_PATH, lines: hermesLog.slice(-200) }))
 
 // Renderer error-boundary catches (#79428 defect B): the component stack only
 // exists in renderer memory, so the boundary posts it here and we persist it
 // via the desktop.log pipeline. `on`, not `handle` — the sender may be mid-
 // crash and must not await. Flush immediately: a crashing window can be gone
 // before the debounced flush timer fires.
-ipcMain.on('hermes:logs:renderer-error', (_event, report) => {
+ipcMainWeb.on('hermes:logs:renderer-error', (_event, report) => {
   const { label, boundary, message, componentStack } = report && typeof report === 'object' ? report : {}
   rememberLog(formatRendererBoundaryReport(label, boundary, message, componentStack))
   flushDesktopLogBufferSync()
@@ -17001,7 +17001,7 @@ const terminalIpc = registerTerminalIpc({
 
 const disposeTerminalSession = terminalIpc.disposeTerminalSession
 
-ipcMain.handle('hermes:updates:check', async () =>
+ipcMainWeb.handle('hermes:updates:check', async () =>
   checkUpdates().catch(error => ({
     supported: true,
     branch: readDesktopUpdateConfig().branch,
@@ -17011,7 +17011,7 @@ ipcMain.handle('hermes:updates:check', async () =>
   }))
 )
 
-ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
+ipcMainWeb.handle('hermes:updates:apply', async (_event, payload) =>
   applyUpdates(payload || {}).catch(error => ({
     ok: false,
     error: 'apply-failed',
@@ -17019,9 +17019,9 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
   }))
 )
 
-ipcMain.handle('hermes:updates:branch:get', async () => readDesktopUpdateConfig())
+ipcMainWeb.handle('hermes:updates:branch:get', async () => readDesktopUpdateConfig())
 
-ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
+ipcMainWeb.handle('hermes:updates:branch:set', async (_event, name) => {
   const branch = typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_UPDATE_BRANCH
   writeDesktopUpdateConfig({ branch })
 
@@ -17083,7 +17083,7 @@ function showAboutPanelFresh() {
   })
 }
 
-ipcMain.handle('hermes:version', async () => {
+ipcMainWeb.handle('hermes:version', async () => {
   const skew = await detectRendererSkew()
 
   return {
@@ -17305,8 +17305,8 @@ async function runDesktopUninstall(mode) {
   return { ok: true, mode, willRemoveAppBundle: Boolean(removeBundle), scriptPath }
 }
 
-ipcMain.handle('hermes:uninstall:summary', async () => getUninstallSummary())
-ipcMain.handle('hermes:uninstall:run', async (_event, payload) => {
+ipcMainWeb.handle('hermes:uninstall:summary', async () => getUninstallSummary())
+ipcMainWeb.handle('hermes:uninstall:run', async (_event, payload) => {
   const mode = payload && typeof payload === 'object' ? payload.mode : payload
 
   return runDesktopUninstall(String(mode || ''))
@@ -17314,10 +17314,10 @@ ipcMain.handle('hermes:uninstall:run', async (_event, payload) => {
 
 // Download a VS Code Marketplace extension and return the raw color-theme JSON
 // it contributes. No theme code is executed — we only read JSON from the .vsix.
-ipcMain.handle('hermes:vscode-theme:fetch', async (_event, id) => fetchMarketplaceThemes(String(id || '')))
+ipcMainWeb.handle('hermes:vscode-theme:fetch', async (_event, id) => fetchMarketplaceThemes(String(id || '')))
 
 // Search the Marketplace for color-theme extensions (empty query = top installs).
-ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMarketplaceThemes(String(query || ''), 20))
+ipcMainWeb.handle('hermes:vscode-theme:search', async (_event, query) => searchMarketplaceThemes(String(query || ''), 20))
 
 // ---------------------------------------------------------------------------
 // hermes:// deep links (e.g. hermes://blueprint/morning-brief?time=08:00,
@@ -17398,7 +17398,7 @@ function handleDeepLink(url) {
 
 // Renderer calls this (via IPC) once it has mounted its deep-link listener, so
 // a link that arrived during boot/install is flushed exactly once.
-ipcMain.handle('hermes:deep-link-ready', () => {
+ipcMainWeb.handle('hermes:deep-link-ready', () => {
   _rendererReadyForDeepLink = true
 
   if (_pendingDeepLink) {
