@@ -472,6 +472,8 @@ function desktopDistArtifact(name: string): string {
   return IS_PACKAGED && unpacked && fs.existsSync(unpacked) ? unpacked : path.join(APP_ROOT, 'dist', name)
 }
 
+type PreloadWebGatewayProxy = { baseUrl: string; token: string }
+
 type PreloadWebServerAddress = { host: string; port: number }
 
 type PendingPreloadWebServerStart = {
@@ -484,6 +486,7 @@ let preloadWebServerAddress: PreloadWebServerAddress | null = null
 let preloadWebServerStart: Promise<PreloadWebServerAddress> | null = null
 let preloadWebServerReady: PendingPreloadWebServerStart | null = null
 let preloadWebIpcMessageHandler: ((message: unknown) => void) | null = null
+let preloadWebGatewayProxy: PreloadWebGatewayProxy | null = null
 
 const preloadWebChildProxy = {
   on(event: string, listener: (message: unknown) => void) {
@@ -522,6 +525,34 @@ const WEB_ALLOWED_ORIGINS = (process.env.HERMES_DESKTOP_WEB_ALLOWED_ORIGINS || '
 
 const PRELOAD_WEB_SERVER_PATH = desktopDistArtifact('electron-preload-web.js')
 
+function updatePreloadWebGatewayProxy(target: PreloadWebGatewayProxy | null): void {
+  preloadWebGatewayProxy = target
+
+  if (!preloadWebServerProcess?.connected) {
+    return
+  }
+
+  preloadWebServerProcess.send({ type: 'gateway-config', gateway: target }, error => {
+    if (error) {
+      rememberLog(`[web-api] gateway proxy configuration failed: ${error.message}`)
+    }
+  })
+}
+
+function gatewayProxyForConnection(connection: any): PreloadWebGatewayProxy | null {
+  if (
+    !connection ||
+    connection.mode !== 'local' ||
+    typeof connection.baseUrl !== 'string' ||
+    typeof connection.token !== 'string' ||
+    !connection.token
+  ) {
+    return null
+  }
+
+  return { baseUrl: connection.baseUrl, token: connection.token }
+}
+
 function handlePreloadWebServerMessage(message: unknown): void {
   if (
     message &&
@@ -537,6 +568,7 @@ function handlePreloadWebServerMessage(message: unknown): void {
     preloadWebServerAddress = address
     preloadWebServerReady?.resolve(address)
     preloadWebServerReady = null
+    updatePreloadWebGatewayProxy(preloadWebGatewayProxy)
 
     return
   }
@@ -567,7 +599,8 @@ function startPreloadWebServer(): Promise<PreloadWebServerAddress> {
         HERMES_DESKTOP_WEB_BRIDGE_PROCESS: '1',
         HERMES_DESKTOP_WEB_ALLOWED_ORIGINS: WEB_ALLOWED_ORIGINS.join(','),
         HERMES_DESKTOP_WEB_HOST: WEB_HOST,
-        HERMES_DESKTOP_WEB_PORT: String(WEB_PORT)
+        HERMES_DESKTOP_WEB_PORT: String(WEB_PORT),
+        HERMES_DESKTOP_WEB_DIST: resolveWebDist()
       },
       execPath: process.execPath,
       execArgv: [],
@@ -575,6 +608,7 @@ function startPreloadWebServer(): Promise<PreloadWebServerAddress> {
     })
 
     preloadWebServerProcess = child
+    updatePreloadWebGatewayProxy(preloadWebGatewayProxy)
     child.on('message', handlePreloadWebServerMessage)
     child.once('error', error => {
       failPreloadWebServerStart(error)
@@ -12587,6 +12621,7 @@ async function startHermes() {
       // and file panels don't spawn wsl.exe (or the interactive install prompt
       // on WSL-less machines) for unresolvable paths. (#66433)
       setWslBridgeProfileState(primaryProfile, false)
+      updatePreloadWebGatewayProxy(null)
 
       return setup.connection
     }
@@ -12775,6 +12810,7 @@ async function startHermes() {
       running: true,
       error: null
     })
+    updatePreloadWebGatewayProxy({ baseUrl, token: authToken })
 
     // A successful boot (including a soft restart that the repair-guard
     // chose over a hard reinstall, see #74874) means any in-flight repair
@@ -14375,8 +14411,14 @@ ipcMainWeb.handle('hermes:connection', async (_event, profile) => {
   const profileKey = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
   const connection = await backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))
   const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
+  const result = connectionId ? { ...connection, connectionId } : connection
+  const gatewayProxy = gatewayProxyForConnection(result)
 
-  return connectionId ? { ...connection, connectionId } : connection
+  if (gatewayProxy) {
+    updatePreloadWebGatewayProxy(gatewayProxy)
+  }
+
+  return result
 })
 // Registry-scoped variant: resolve a backend for (connectionId, profile).
 // connectionId '' / 'local' / the registry primary all behave sensibly; the
@@ -14391,8 +14433,14 @@ ipcMainWeb.handle('hermes:connection:for', async (_event, payload) => {
   // (connectionId, profile) scope (#90812): concurrent registry dials for one
   // scope share the first spawn instead of bootstrapping duplicate remotes.
   const connection = await backendDialClaims.run(backendScopeKey(id, profile), () => ensureRegistryBackend(id, profile))
+  const result = { ...connection, connectionId: id, registryScoped: true }
+  const gatewayProxy = gatewayProxyForConnection(result)
 
-  return { ...connection, connectionId: id, registryScoped: true }
+  if (gatewayProxy) {
+    updatePreloadWebGatewayProxy(gatewayProxy)
+  }
+
+  return result
 })
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()

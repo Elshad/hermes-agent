@@ -57,6 +57,87 @@ function apiUrl(path: string): string {
   return base ? `${base}${path}` : path
 }
 
+function isLoopbackUrl(value: unknown): boolean {
+  if (typeof value !== 'string') {
+    return false
+  }
+
+  try {
+    const hostname = new URL(value).hostname.toLowerCase()
+
+    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1' || hostname === '[::1]'
+  } catch {
+    return false
+  }
+}
+
+function browserGatewayWsUrl(value: string): string {
+  if (!isLoopbackUrl(value) || !apiBaseUrl()) {
+    return value
+  }
+
+  const source = new URL(value)
+  const target = new URL('/api/ws', apiBaseUrl())
+
+  for (const [name, entry] of source.searchParams) {
+    if (name !== 'token' && name !== 'ticket') {
+      target.searchParams.append(name, entry)
+    }
+  }
+
+  target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:'
+
+  return target.toString()
+}
+
+function browserConnectionDescriptor<T>(value: T): T {
+  if (!value || typeof value !== 'object') {
+    return value
+  }
+
+  const descriptor = value as T & { baseUrl?: unknown; mode?: unknown; source?: unknown; token?: unknown; wsUrl?: unknown }
+
+  const local =
+    descriptor.mode === 'local' ||
+    descriptor.source === 'local' ||
+    isLoopbackUrl(descriptor.baseUrl) ||
+    isLoopbackUrl(descriptor.wsUrl)
+
+  if (!local || !apiBaseUrl()) {
+    return value
+  }
+
+  return {
+    ...descriptor,
+    ...(typeof descriptor.baseUrl === 'string' ? { baseUrl: apiBaseUrl() } : {}),
+    ...(typeof descriptor.token === 'string' ? { token: '' } : {}),
+    ...(typeof descriptor.wsUrl === 'string' ? { wsUrl: browserGatewayWsUrl(descriptor.wsUrl) } : {})
+  } as T
+}
+
+function normalizeInvokeResult<T>(channel: string, value: T): T {
+  if (channel === 'hermes:connection' || channel === 'hermes:connection:for') {
+    return browserConnectionDescriptor(value)
+  }
+
+  if (channel !== 'hermes:gateway:ws-url' && channel !== 'hermes:gateway:ws-url-for') {
+    return value
+  }
+
+  if (typeof value === 'string') {
+    return browserGatewayWsUrl(value) as T
+  }
+
+  if (value && typeof value === 'object' && typeof (value as { wsUrl?: unknown }).wsUrl === 'string') {
+    return {
+      ...(value as object),
+      wsUrl: browserGatewayWsUrl((value as unknown as { wsUrl: string }).wsUrl)
+    } as T
+  }
+
+  return value
+}
+
 function socketUrl(): string {
   const base = apiBaseUrl()
 
@@ -108,8 +189,8 @@ class WebIpcRenderer {
   private reconnectDelay = DEFAULT_RECONNECT_DELAY_MS
   private closed = false
 
-  invoke<T = unknown>(channel: string, ...args: unknown[]): Promise<T> {
-    return post<T>('/web-api/invoke', channel, args)
+  async invoke<T = unknown>(channel: string, ...args: unknown[]): Promise<T> {
+    return normalizeInvokeResult(channel, await post<T>('/web-api/invoke', channel, args))
   }
 
   /**

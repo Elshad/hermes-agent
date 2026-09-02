@@ -34,10 +34,22 @@ test('exposes hermesDesktop and routes getConnection through web-api invoke', as
       args: ['work']
     })
 
-    return new Response(JSON.stringify({ ok: true, result: { profile: 'work' } }), {
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        result: {
+          profile: 'work',
+          mode: 'local',
+          baseUrl: 'http://127.0.0.1:43123',
+          wsUrl: 'ws://127.0.0.1:43123/api/ws?token=internal-token',
+          token: 'internal-token'
+        }
+      }),
+      {
       status: 200,
       headers: { 'Content-Type': 'application/json' }
-    })
+      }
+    )
   })
 
   vi.stubGlobal('fetch', fetchMock)
@@ -46,6 +58,12 @@ test('exposes hermesDesktop and routes getConnection through web-api invoke', as
 
   const desktop = (globalThis.window as WebDesktopWindow).hermesDesktop
   assert.ok(desktop)
-  assert.deepEqual(await desktop.getConnection('work'), { profile: 'work' })
+  assert.deepEqual(await desktop.getConnection('work'), {
+    profile: 'work',
+    mode: 'local',
+    baseUrl: 'http://127.0.0.1:13043',
+    wsUrl: 'ws://127.0.0.1:13043/api/ws',
+    token: ''
+  })
   assert.equal(fetchMock.mock.calls.length, 1)
 })

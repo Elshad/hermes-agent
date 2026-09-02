@@ -7,11 +7,20 @@
  * handlers and keeps this server independent from Electron.
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { createReadStream, readFileSync, statSync } from 'node:fs'
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse
+} from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { connect as netConnect } from 'node:net'
 import { extname, join, relative, resolve, sep } from 'node:path'
 import type { Duplex } from 'node:stream'
+import { connect as tlsConnect } from 'node:tls'
 
 import { MyIpcRenderer } from './preload-web-helper'
 
@@ -20,6 +29,9 @@ export const ipcRendererWeb = new MyIpcRenderer()
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_MAX_BODY_BYTES = 1 * 1024 * 1024
 const WEBSOCKET_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+/** Gateway routes that must be reachable from the browser-facing origin. */
+export const PROXY_PREFIXES = ['/api/', '/api', '/auth/', '/auth', '/login', '/logout', '/oauth/', '/oauth']
 
 export interface PreloadWebRequestContext {
   kind: 'invoke' | 'send'
@@ -39,6 +51,13 @@ export interface PreloadWebServerOptions {
   staticDir?: string
   /** Explicit browser origins allowed to call the loopback HTTP server. */
   allowedOrigins?: string[]
+  /** Server-owned local gateway target. The token never leaves this process. */
+  gatewayProxy?: PreloadWebGatewayProxy | null
+}
+
+export interface PreloadWebGatewayProxy {
+  baseUrl: string
+  token: string
 }
 
 export interface PreloadWebServerAddress {
@@ -51,6 +70,7 @@ export interface PreloadWebServer {
   start(): Promise<PreloadWebServerAddress>
   stop(): Promise<void>
   emit(channel: string, ...args: unknown[]): void
+  setGatewayProxy(target: PreloadWebGatewayProxy | null): void
 }
 
 interface WebApiRequest {
@@ -75,6 +95,7 @@ export type PreloadWebProcessMessage =
       error?: { message: string; name: string; statusCode?: number }
     }
   | { type: 'event'; channel: string; args: unknown[] }
+  | { type: 'gateway-config'; gateway: PreloadWebGatewayProxy | null }
   | { type: 'stop' }
   | { type: 'fatal'; error: { message: string; name: string; statusCode?: number } }
 
@@ -212,6 +233,226 @@ function readWebsocketFrames(client: EventSocket): void {
 
 function websocketAccept(key: string): string {
   return createHash('sha1').update(`${key}${WEBSOCKET_GUID}`).digest('base64')
+}
+
+function isProxyPath(pathname: string): boolean {
+  return PROXY_PREFIXES.some(prefix => pathname === prefix || (prefix.endsWith('/') && pathname.startsWith(prefix)))
+}
+
+function proxyUrl(
+  target: PreloadWebGatewayProxy,
+  requestUrl: string,
+  host: string,
+  includeWebsocketToken = false
+): URL {
+  const base = new URL(target.baseUrl)
+  const incoming = new URL(requestUrl || '/', `http://${host}`)
+  const basePath = base.pathname.replace(/\/+$/, '')
+
+  base.pathname = `${basePath}${incoming.pathname}` || '/'
+  base.search = incoming.search
+  base.hash = ''
+  // Credentials are always supplied by the server-owned target. A browser
+  // must not be able to replace them through a stale query string.
+  base.searchParams.delete('token')
+  base.searchParams.delete('ticket')
+
+  // The loopback gateway authenticates /api/ws with its query token (the HTTP
+  // API accepts the session-token header, but the WebSocket handshake does not).
+  // Add the server-owned credential only to this private upstream URL; it is
+  // never sent back in the browser-facing response or descriptor.
+  if (includeWebsocketToken) {
+    base.searchParams.set('token', target.token)
+  }
+
+  return base
+}
+
+function proxyHeaders(request: IncomingMessage, target: URL): Record<string, string | string[]> {
+  const headers: Record<string, string | string[]> = {}
+
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (
+      value === undefined ||
+      ['connection', 'content-length', 'cookie', 'host', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'].includes(name)
+    ) {
+      continue
+    }
+
+    headers[name] = value
+  }
+
+  headers.host = target.host
+  headers.origin = target.origin
+  headers['x-hermes-session-token'] = ''
+
+  return headers
+}
+
+function proxyHttp(
+  request: IncomingMessage,
+  response: ServerResponse,
+  target: PreloadWebGatewayProxy,
+  host: string,
+  responseOrigin?: string
+): void {
+  let destination: URL
+
+  try {
+    destination = proxyUrl(target, request.url || '/', host)
+  } catch {
+    jsonResponse(response, 502, { ok: false, error: { message: 'Configured Hermes backend is unavailable.', name: 'BadGateway' } }, responseOrigin)
+
+    return
+  }
+
+  const headers = proxyHeaders(request, destination)
+  headers['x-hermes-session-token'] = target.token
+  const client = destination.protocol === 'https:' ? httpsRequest : httpRequest
+
+  const upstream = client(
+    destination,
+    { method: request.method, headers },
+    upstreamResponse => {
+      response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers)
+      upstreamResponse.pipe(response)
+    }
+  )
+
+  upstream.once('error', () => {
+    if (!response.headersSent) {
+      jsonResponse(
+        response,
+        502,
+        { ok: false, error: { message: 'Configured Hermes backend is unavailable.', name: 'BadGateway' } },
+        responseOrigin
+      )
+    } else {
+      response.destroy()
+    }
+  })
+  request.once('aborted', () => upstream.destroy())
+  request.pipe(upstream)
+}
+
+function websocketProxyHeaders(request: IncomingMessage, target: URL, key: string, token: string): string {
+  const lines = [`GET ${target.pathname}${target.search} HTTP/1.1`, `Host: ${target.host}`, 'Upgrade: websocket', 'Connection: Upgrade', `Sec-WebSocket-Key: ${key}`, 'Sec-WebSocket-Version: 13', `Origin: ${target.origin}`, `X-Hermes-Session-Token: ${token}`]
+
+  for (const name of ['sec-websocket-protocol', 'sec-websocket-extensions', 'user-agent']) {
+    const value = request.headers[name]
+
+    if (typeof value === 'string') {
+      lines.push(`${name}: ${value}`)
+    }
+  }
+
+  return `${lines.join('\r\n')}\r\n\r\n`
+}
+
+function proxyWebsocket(request: IncomingMessage, socket: Duplex, head: Buffer, target: PreloadWebGatewayProxy, host: string): void {
+  let destination: URL
+  const browserKey = request.headers['sec-websocket-key']
+
+  if (typeof browserKey !== 'string') {
+    socket.destroy()
+
+    return
+  }
+
+  try {
+    destination = proxyUrl(target, request.url || '/', host, true)
+  } catch {
+    socket.destroy()
+
+    return
+  }
+
+  const upstreamKey = randomBytes(16).toString('base64')
+  let upstream: Duplex
+  let responseBuffer = Buffer.alloc(0)
+  let established = false
+  let handshakeSent = false
+
+  const sendHandshake = () => {
+    if (handshakeSent) {
+      return
+    }
+
+    handshakeSent = true
+    upstream.write(websocketProxyHeaders(request, destination, upstreamKey, target.token))
+  }
+
+  upstream =
+    destination.protocol === 'https:'
+      ? tlsConnect({ host: destination.hostname, port: Number(destination.port) || 443, servername: destination.hostname })
+      : netConnect({ host: destination.hostname, port: Number(destination.port) || 80 }, sendHandshake)
+
+  const fail = () => {
+    if (!established) {
+      socket.destroy()
+    }
+
+    upstream.destroy()
+  }
+
+  if (destination.protocol === 'https:') {
+    upstream.once('secureConnect', sendHandshake)
+  }
+
+  upstream.on('data', chunk => {
+    if (established) {
+      socket.write(chunk)
+
+      return
+    }
+
+    responseBuffer = Buffer.concat([responseBuffer, chunk])
+    const headerEnd = responseBuffer.indexOf('\r\n\r\n')
+
+    if (headerEnd < 0) {
+      return
+    }
+
+    const headerText = responseBuffer.subarray(0, headerEnd).toString('latin1')
+
+    if (!/^HTTP\/1\.1 101(?:\s|$)/i.test(headerText)) {
+      fail()
+
+      return
+    }
+
+    const responseLines = ['HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade', `Sec-WebSocket-Accept: ${websocketAccept(browserKey)}`]
+
+    for (const line of headerText.split('\r\n').slice(1)) {
+      if (/^sec-websocket-(protocol|extensions):/i.test(line)) {
+        responseLines.push(line)
+      }
+    }
+
+    socket.write(`${responseLines.join('\r\n')}\r\n\r\n`)
+    established = true
+
+    const remainder = responseBuffer.subarray(headerEnd + 4)
+
+    if (remainder.length) {
+      socket.write(remainder)
+    }
+
+    if (head.length) {
+      upstream.write(head)
+    }
+
+    socket.pipe(upstream)
+    upstream.pipe(socket)
+  })
+  upstream.once('error', fail)
+  upstream.once('close', () => {
+    if (!socket.destroyed) {
+      socket.destroy()
+    }
+  })
+  socket.once('error', () => upstream.destroy())
+  socket.once('close', () => upstream.destroy())
 }
 
 function readBody(request: IncomingMessage, maxBodyBytes: number): Promise<WebApiRequest> {
@@ -398,6 +639,7 @@ export function createPreloadWebServer(options: PreloadWebServerOptions): Preloa
     })
 
   const staticDir = options.staticDir
+  let gatewayProxy = options.gatewayProxy || null
 
   function allowedOrigin(request: IncomingMessage): string | undefined {
     const origin = request.headers.origin
@@ -455,6 +697,23 @@ export function createPreloadWebServer(options: PreloadWebServerOptions): Preloa
       return
     }
 
+    if (isProxyPath(url.pathname)) {
+      if (!gatewayProxy) {
+        jsonResponse(
+          response,
+          503,
+          { ok: false, error: { message: 'Hermes gateway is not ready.', name: 'ServiceUnavailable' } },
+          responseOrigin
+        )
+
+        return
+      }
+
+      proxyHttp(request, response, gatewayProxy, request.headers.host || `${host}:${options.port || 0}`, responseOrigin)
+
+      return
+    }
+
     if (!url.pathname.startsWith(webApiPath) && (await serveStatic(request, response, url.pathname, staticDir))) {
       return
     }
@@ -491,6 +750,19 @@ export function createPreloadWebServer(options: PreloadWebServerOptions): Preloa
 
   server.on('upgrade', (request, socket, head) => {
     const url = new URL(request.url || '/', `http://${request.headers.host || `${host}:${options.port || 0}`}`)
+
+    if (
+      isProxyPath(url.pathname) &&
+      gatewayProxy &&
+      request.headers.upgrade?.toLowerCase() === 'websocket' &&
+      request.headers['sec-websocket-version'] === '13' &&
+      typeof request.headers['sec-websocket-key'] === 'string' &&
+      !(request.headers.origin && !allowedOrigin(request))
+    ) {
+      proxyWebsocket(request, socket, head, gatewayProxy, request.headers.host || `${host}:${options.port || 0}`)
+
+      return
+    }
 
     if (
       url.pathname !== eventsPath ||
@@ -531,6 +803,9 @@ export function createPreloadWebServer(options: PreloadWebServerOptions): Preloa
 
   return {
     server,
+    setGatewayProxy: target => {
+      gatewayProxy = target
+    },
     start: () =>
       new Promise((resolve, reject) => {
         const onError = (error: Error) => {
@@ -653,6 +928,12 @@ export async function runPreloadWebServerProcess(): Promise<void> {
   }
 
   process.on('message', (message: PreloadWebProcessMessage) => {
+    if (message?.type === 'gateway-config') {
+      webServer.setGatewayProxy(message.gateway)
+
+      return
+    }
+
     if (message?.type === 'stop') {
       void shutdown()
     }
