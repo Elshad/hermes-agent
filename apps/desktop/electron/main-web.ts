@@ -184,7 +184,7 @@ import {
   stopFind
 } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
-import { registerFsIpc } from './fs-ipc'
+import { registerFsIpc } from './fs-ipc-web'
 import {
   filenameFromContentDisposition,
   fsPumpDeps,
@@ -472,7 +472,7 @@ function desktopDistArtifact(name: string): string {
   return IS_PACKAGED && unpacked && fs.existsSync(unpacked) ? unpacked : path.join(APP_ROOT, 'dist', name)
 }
 
-type PreloadWebGatewayProxy = { baseUrl: string; token: string }
+type PreloadWebGatewayProxy = { baseUrl: string; token: string; headers?: Record<string, string>; wsUrl?: string }
 
 type PreloadWebServerAddress = { host: string; port: number }
 
@@ -539,18 +539,68 @@ function updatePreloadWebGatewayProxy(target: PreloadWebGatewayProxy | null): vo
   })
 }
 
-function gatewayProxyForConnection(connection: any): PreloadWebGatewayProxy | null {
+async function gatewayProxyForConnection(connection: any): Promise<PreloadWebGatewayProxy | null> {
   if (
     !connection ||
-    connection.mode !== 'local' ||
-    typeof connection.baseUrl !== 'string' ||
-    typeof connection.token !== 'string' ||
-    !connection.token
+    typeof connection.baseUrl !== 'string'
   ) {
     return null
   }
 
-  return { baseUrl: connection.baseUrl, token: connection.token }
+  const headers: Record<string, string> =
+    connection.headers && typeof connection.headers === 'object'
+      ? Object.fromEntries(
+          Object.entries(connection.headers).filter(
+            ([name, value]) => typeof value === 'string' && !['host', 'origin', 'x-hermes-session-token'].includes(name.toLowerCase())
+          )
+        )
+      : {}
+
+  const token = typeof connection.token === 'string' ? connection.token : ''
+
+  if (connection.authMode === 'oauth') {
+    try {
+      const accessToken = await ensureNativeAccessToken(connection.baseUrl)
+
+      if (accessToken) {
+        headers && (headers.authorization = `Bearer ${accessToken}`)
+      }
+    } catch {
+      // The normal connection check already classifies OAuth failures. Keep
+      // this proxy refresh best-effort so a transient token refresh does not
+      // turn a usable cookie session into a renderer crash.
+    }
+
+    try {
+      const oauthSession = getOauthSessionForUrl(connection.baseUrl)
+
+      if (oauthSession) {
+        await warmOauthCookieStore(connection.baseUrl)
+        const cookies = await oauthSession.cookies.get({ url: connection.baseUrl })
+
+        if (cookies.length > 0) {
+          headers && (headers.cookie = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
+        }
+      }
+    } catch {
+      // Cookie access is best-effort; native bearer/custom headers may still
+      // authenticate the same connection.
+    }
+  }
+
+  const proxyHeaders = headers && Object.keys(headers).length > 0 ? headers : undefined
+  const wsUrl = connection.authMode === 'oauth' && typeof connection.wsUrl === 'string' ? connection.wsUrl : undefined
+
+  if (!token && !proxyHeaders && !wsUrl) {
+    return null
+  }
+
+  return {
+    baseUrl: connection.baseUrl,
+    token,
+    ...(proxyHeaders ? { headers: proxyHeaders } : {}),
+    ...(wsUrl ? { wsUrl } : {})
+  }
 }
 
 function handlePreloadWebServerMessage(message: unknown): void {
@@ -3091,6 +3141,7 @@ function emitUpdateProgress(payload) {
 
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send('hermes:updates:progress', merged)
+    ipcMainWeb.send('hermes:updates:progress', merged)
   }
 }
 
@@ -6460,6 +6511,7 @@ function sendBackendExit(payload) {
   }
 
   webContents.send('hermes:backend-exit', payload)
+  ipcMainWeb.send('hermes:backend-exit', payload)
 }
 
 function sendClosePreviewRequested() {
@@ -6683,6 +6735,7 @@ function sendOpenUpdatesRequested() {
   }
 
   webContents.send('hermes:open-updates')
+  ipcMainWeb.send('hermes:open-updates')
 
   if (!mainWindow.isVisible()) {
     mainWindow.show()
@@ -8160,12 +8213,14 @@ async function freshGatewayWsUrl(profile) {
     const wsUrl = buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
 
     rememberRemoteWsHeaders(wsUrl, connection.headers)
+    updatePreloadWebGatewayProxy(await gatewayProxyForConnection({ ...connection, wsUrl }))
 
     return wsUrl
   }
 
   // Local/token: the cached wsUrl already carries the (long-lived) token.
   rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
+  updatePreloadWebGatewayProxy(await gatewayProxyForConnection(connection))
 
   return connection.wsUrl
 }
@@ -12621,7 +12676,7 @@ async function startHermes() {
       // and file panels don't spawn wsl.exe (or the interactive install prompt
       // on WSL-less machines) for unresolvable paths. (#66433)
       setWslBridgeProfileState(primaryProfile, false)
-      updatePreloadWebGatewayProxy(null)
+      updatePreloadWebGatewayProxy(await gatewayProxyForConnection(setup.connection))
 
       return setup.connection
     }
@@ -14412,11 +14467,8 @@ ipcMainWeb.handle('hermes:connection', async (_event, profile) => {
   const connection = await backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))
   const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
   const result = connectionId ? { ...connection, connectionId } : connection
-  const gatewayProxy = gatewayProxyForConnection(result)
-
-  if (gatewayProxy) {
-    updatePreloadWebGatewayProxy(gatewayProxy)
-  }
+  const gatewayProxy = await gatewayProxyForConnection(result)
+  updatePreloadWebGatewayProxy(gatewayProxy)
 
   return result
 })
@@ -14434,11 +14486,8 @@ ipcMainWeb.handle('hermes:connection:for', async (_event, payload) => {
   // scope share the first spawn instead of bootstrapping duplicate remotes.
   const connection = await backendDialClaims.run(backendScopeKey(id, profile), () => ensureRegistryBackend(id, profile))
   const result = { ...connection, connectionId: id, registryScoped: true }
-  const gatewayProxy = gatewayProxyForConnection(result)
-
-  if (gatewayProxy) {
-    updatePreloadWebGatewayProxy(gatewayProxy)
-  }
+  const gatewayProxy = await gatewayProxyForConnection(result)
+  updatePreloadWebGatewayProxy(gatewayProxy)
 
   return result
 })
@@ -17072,7 +17121,10 @@ registerFsIpc({
   expandUserPath,
   resolveRequestedPathForIpc,
   directoryExists,
-  resolveGitBinary
+  resolveGitBinary,
+  ipcMainWeb
+}, {
+  handle: (channel, handler) => ipcMainWeb.handle(channel, handler as Parameters<typeof ipcMainWeb.handle>[1])
 })
 
 // Git-driven features (worktrees, review pane, repo scan) — see git-ipc.ts.

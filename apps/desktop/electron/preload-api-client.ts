@@ -57,27 +57,22 @@ function apiUrl(path: string): string {
   return base ? `${base}${path}` : path
 }
 
-function isLoopbackUrl(value: unknown): boolean {
-  if (typeof value !== 'string') {
-    return false
-  }
-
-  try {
-    const hostname = new URL(value).hostname.toLowerCase()
-
-    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1' || hostname === '[::1]'
-  } catch {
-    return false
-  }
-}
-
 function browserGatewayWsUrl(value: string): string {
-  if (!isLoopbackUrl(value) || !apiBaseUrl()) {
+  const base = apiBaseUrl()
+
+  if (!base) {
     return value
   }
 
-  const source = new URL(value)
-  const target = new URL('/api/ws', apiBaseUrl())
+  let source: URL
+
+  try {
+    source = new URL(value, base)
+  } catch {
+    return value
+  }
+
+  const target = new URL('/api/ws', base)
 
   for (const [name, entry] of source.searchParams) {
     if (name !== 'token' && name !== 'ticket') {
@@ -91,28 +86,44 @@ function browserGatewayWsUrl(value: string): string {
 }
 
 function browserConnectionDescriptor<T>(value: T): T {
-  if (!value || typeof value !== 'object') {
+  if (!value || typeof value !== 'object' || !apiBaseUrl()) {
     return value
   }
 
-  const descriptor = value as T & { baseUrl?: unknown; mode?: unknown; source?: unknown; token?: unknown; wsUrl?: unknown }
-
-  const local =
-    descriptor.mode === 'local' ||
-    descriptor.source === 'local' ||
-    isLoopbackUrl(descriptor.baseUrl) ||
-    isLoopbackUrl(descriptor.wsUrl)
-
-  if (!local || !apiBaseUrl()) {
-    return value
+  const descriptor = value as T & {
+    baseUrl?: unknown
+    headers?: unknown
+    mode?: unknown
+    remoteHeaders?: unknown
+    source?: unknown
+    token?: unknown
+    wsUrl?: unknown
   }
 
-  return {
-    ...descriptor,
-    ...(typeof descriptor.baseUrl === 'string' ? { baseUrl: apiBaseUrl() } : {}),
-    ...(typeof descriptor.token === 'string' ? { token: '' } : {}),
-    ...(typeof descriptor.wsUrl === 'string' ? { wsUrl: browserGatewayWsUrl(descriptor.wsUrl) } : {})
-  } as T
+  // The renderer always talks to the Desktop-Web origin. This applies to
+  // remote descriptors too: loopback detection alone would leak a configured
+  // remote gateway URL and make the browser dial it directly.
+  const browserDescriptor = { ...descriptor } as typeof descriptor & Record<string, unknown>
+
+  if (typeof descriptor.baseUrl === 'string') {
+    browserDescriptor.baseUrl = apiBaseUrl()
+  }
+
+  if (typeof descriptor.wsUrl === 'string') {
+    browserDescriptor.wsUrl = browserGatewayWsUrl(descriptor.wsUrl)
+  }
+
+  if ('token' in descriptor) {
+    browserDescriptor.token = ''
+  }
+
+  // Connection descriptors may carry OAuth/bearer headers for the native
+  // client. They are server-owned credentials and must never cross into the
+  // browser renderer.
+  delete browserDescriptor.headers
+  delete browserDescriptor.remoteHeaders
+
+  return browserDescriptor as T
 }
 
 function normalizeInvokeResult<T>(channel: string, value: T): T {

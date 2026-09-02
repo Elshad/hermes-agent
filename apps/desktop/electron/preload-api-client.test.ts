@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 
-import { afterEach, test, vi } from 'vitest'
+import { afterEach, beforeEach, test, vi } from 'vitest'
 
 type WebDesktopWindow = Window & {
   hermesDesktop?: {
@@ -12,6 +12,10 @@ afterEach(() => {
   vi.restoreAllMocks()
   Reflect.deleteProperty(globalThis, 'window')
   Reflect.deleteProperty(globalThis, 'location')
+})
+
+beforeEach(() => {
+  vi.resetModules()
 })
 
 test('exposes hermesDesktop and routes getConnection through web-api invoke', async () => {
@@ -66,4 +70,47 @@ test('exposes hermesDesktop and routes getConnection through web-api invoke', as
     token: ''
   })
   assert.equal(fetchMock.mock.calls.length, 1)
+})
+
+test('keeps remote gateway descriptors on the Desktop-Web origin', async () => {
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {}
+  })
+  Object.defineProperty(globalThis, 'location', {
+    configurable: true,
+    value: { origin: 'https://desktop.example' }
+  })
+
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          result: {
+            mode: 'remote',
+            authMode: 'oauth',
+            baseUrl: 'https://remote-gateway.example',
+            wsUrl: 'wss://remote-gateway.example/api/ws?profile=work&ticket=private-ticket',
+            token: null,
+            headers: { Authorization: 'Bearer private-token' }
+          }
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    )
+  )
+
+  await import('./preload-api-client')
+
+  const desktop = (globalThis.window as WebDesktopWindow).hermesDesktop
+  assert.ok(desktop)
+  assert.deepEqual(await desktop.getConnection('work'), {
+    mode: 'remote',
+    authMode: 'oauth',
+    baseUrl: 'https://desktop.example',
+    wsUrl: 'wss://desktop.example/api/ws?profile=work',
+    token: ''
+  })
 })

@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// bundle-electron-main-web.mjs — bundles electron/main-web.ts and electron/preload-web.ts
+// bundle-electron-main-web.mjs — bundles the Desktop-Web Electron entrypoints
 // into self-contained js files in dist/ so the packaged app doesn't need
 // node_modules/ or tsx at runtime.
 //
 // Output:
 //   dist/electron-main-web.mjs            (MJS bundle — app entry point)
+//   dist/electron-preload.js              (CJS bundle — native BrowserWindow preload)
 //   dist/electron-preload-web.js          (ESM bundle — child HTTP/WebSocket server)
-//   dist/electron-preload-api-client.js   (CJS bundle — BrowserWindow preload)
+//   dist/electron-preload-api-client.js   (IIFE bundle — browser-side Web API client)
 //
 // `electron` and `node-pty` are external (provided by the runtime / staged
 // separately via stage-native-deps).
@@ -22,6 +23,8 @@ mkdirSync(distDir, { recursive: true })
 
 const mainEntry = resolve(root, 'electron/main-web.ts')
 const mainOut = resolve(distDir, 'electron-main-web.mjs')
+const nativePreloadEntry = resolve(root, 'electron/preload.ts')
+const nativePreloadOut = resolve(distDir, 'electron-preload.js')
 const preloadEntry = resolve(root, 'electron/preload-web.ts')
 const preloadOut = resolve(distDir, 'electron-preload-web.js')
 const apiClientEntry = resolve(root, 'electron/preload-api-client.ts')
@@ -53,6 +56,22 @@ await build({
 })
 console.log(`bundled ${mainOut}${isDev ? ' (dev)' : ''}`)
 
+// Bundle preload.ts → dist/electron-preload.js. main-web.ts loads this native
+// contextBridge preload for every Electron BrowserWindow; it is distinct from
+// the browser-side API client below.
+await build({
+  entryPoints: [nativePreloadEntry],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  target: 'node20',
+  outfile: nativePreloadOut,
+  external,
+  define,
+  logLevel: 'info'
+})
+console.log(`bundled ${nativePreloadOut}${isDev ? ' (dev)' : ''}`)
+
 // Bundle preload-web.ts → dist/electron-preload-web.js
 await build({
   entryPoints: [preloadEntry],
@@ -67,13 +86,15 @@ await build({
 })
 console.log(`bundled ${preloadOut}${isDev ? ' (dev)' : ''}`)
 
-// Bundle preload-api-client.ts → dist/electron-preload-api-client.js
+// Bundle preload-api-client.ts → dist/electron-preload-api-client.js. This is
+// loaded by the browser-facing HTML, so it must be a standalone browser script
+// rather than the CommonJS format used by Electron's native preload.
 await build({
   entryPoints: [apiClientEntry],
   bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  target: 'node20',
+  platform: 'browser',
+  format: 'iife',
+  target: 'es2020',
   outfile: apiClientOut,
   external,
   define,

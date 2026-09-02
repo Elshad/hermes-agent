@@ -2,9 +2,10 @@ import { createHash, randomBytes } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, request as httpRequest } from 'node:http'
-import { connect as netConnect, type Socket } from 'node:net'
+import { connect as netConnect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { Duplex } from 'node:stream'
 
 import { describe, expect, it, vi } from 'vitest'
 
@@ -168,13 +169,18 @@ describe('preload web server', () => {
 
     try {
       const response = await fetch(`http://127.0.0.1:${address.port}/api/status?token=browser-token&check=1`, {
-        headers: { Cookie: 'desktop=session', 'X-Hermes-Session-Token': 'browser-token' }
+        headers: {
+          Authorization: 'browser-token',
+          Cookie: 'desktop=session',
+          'X-Hermes-Session-Token': 'browser-token'
+        }
       })
 
       expect(response.status).toBe(200)
       expect(await response.json()).toEqual({ ok: true })
       expect(upstreamRequest).toMatchObject({ url: '/api/status?check=1' })
       expect(upstreamRequest?.headers['x-hermes-session-token']).toBe('server-token')
+      expect(upstreamRequest?.headers.authorization).toBeUndefined()
       expect(upstreamRequest?.headers.cookie).toBeUndefined()
     } finally {
       await server.stop()
@@ -184,11 +190,16 @@ describe('preload web server', () => {
 
   it('proxies gateway WebSocket upgrades and re-signs the browser handshake', async () => {
     let upstreamRequest: { headers: Record<string, string | string[] | undefined>; url: string | undefined } | null = null
-    let upstreamSocket: Socket | null = null
+    let upstreamSocket: Duplex | null = null
+    let upstreamFramePromise: Promise<Buffer> | null = null
     const upstream = createServer()
     upstream.on('upgrade', (request, socket) => {
       upstreamSocket = socket
       upstreamRequest = { headers: request.headers, url: request.url }
+
+      upstreamFramePromise = new Promise(resolve => {
+        socket.once('data', chunk => resolve(chunk))
+      })
 
       if (new URL(request.url || '/', 'http://127.0.0.1').searchParams.get('token') !== 'server-token') {
         socket.end('HTTP/1.1 401 Unauthorized\\r\\nConnection: close\\r\\n\\r\\n')
@@ -247,6 +258,44 @@ describe('preload web server', () => {
       expect(upstreamRequest).toMatchObject({ url: '/api/ws?profile=default&token=server-token' })
       expect(upstreamRequest?.headers['x-hermes-session-token']).toBe('server-token')
       expect(upstreamRequest?.headers.cookie).toBeUndefined()
+
+      const incomingPromise = upstreamFramePromise
+
+      if (!incomingPromise) {
+        throw new Error('Upstream WebSocket did not reach the upgrade handler')
+      }
+
+      const payload = Buffer.from('hello')
+      const mask = Buffer.from([1, 2, 3, 4])
+      const browserFrameToUpstream = Buffer.alloc(2 + mask.length + payload.length)
+      browserFrameToUpstream[0] = 0x81
+      browserFrameToUpstream[1] = 0x80 | payload.length
+      mask.copy(browserFrameToUpstream, 2)
+
+      for (let index = 0; index < payload.length; index += 1) {
+        browserFrameToUpstream[6 + index] = payload[index] ^ mask[index % mask.length]
+      }
+
+      socket.write(browserFrameToUpstream)
+      const upstreamFrame = await incomingPromise
+      const upstreamMask = upstreamFrame.subarray(2, 6)
+      const upstreamPayload = Buffer.alloc(upstreamFrame[1] & 0x7f)
+
+      for (let index = 0; index < upstreamPayload.length; index += 1) {
+        upstreamPayload[index] = upstreamFrame[6 + index] ^ upstreamMask[index % upstreamMask.length]
+      }
+
+      expect(upstreamFrame[0]).toBe(0x81)
+      expect(upstreamFrame[1] & 0x80).toBe(0x80)
+      expect(upstreamMask.equals(mask)).toBe(false)
+      expect(upstreamPayload.toString()).toBe('hello')
+
+      upstreamSocket?.write(Buffer.from([0x81, 0x05, ...Buffer.from('world')]))
+      const [receivedBrowserFrame] = await once(socket, 'data')
+
+      expect(receivedBrowserFrame[0]).toBe(0x81)
+      expect(receivedBrowserFrame[1] & 0x80).toBe(0)
+      expect(receivedBrowserFrame.subarray(2).toString()).toBe('world')
     } finally {
       socket.destroy()
       upstreamSocket?.destroy()

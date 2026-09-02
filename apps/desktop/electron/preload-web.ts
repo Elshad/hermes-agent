@@ -58,6 +58,10 @@ export interface PreloadWebServerOptions {
 export interface PreloadWebGatewayProxy {
   baseUrl: string
   token: string
+  /** Server-owned auth material for OAuth/custom-header remotes. */
+  headers?: Record<string, string>
+  /** Fresh server-owned OAuth WS URL, including its one-use ticket. */
+  wsUrl?: string
 }
 
 export interface PreloadWebServerAddress {
@@ -245,36 +249,61 @@ function proxyUrl(
   host: string,
   includeWebsocketToken = false
 ): URL {
-  const base = new URL(target.baseUrl)
+  const authenticatedWebsocketUrl = includeWebsocketToken && target.wsUrl ? new URL(target.wsUrl) : null
+  const base = authenticatedWebsocketUrl || new URL(target.baseUrl)
   const incoming = new URL(requestUrl || '/', `http://${host}`)
-  const basePath = base.pathname.replace(/\/+$/, '')
 
-  base.pathname = `${basePath}${incoming.pathname}` || '/'
-  base.search = incoming.search
+  if (authenticatedWebsocketUrl) {
+    // The fresh OAuth URL already contains the gateway's exact WS path and
+    // one-use ticket. Only carry non-credential routing parameters from the
+    // browser-facing request into that private URL.
+    const query = new URLSearchParams(base.search)
+
+    for (const [name, value] of incoming.searchParams) {
+      if (name !== 'token' && name !== 'ticket') {
+        query.append(name, value)
+      }
+    }
+
+    base.search = query.toString()
+  } else {
+    const basePath = base.pathname.replace(/\/+$/, '')
+
+    base.pathname = `${basePath}${incoming.pathname}` || '/'
+    base.search = incoming.search
+  }
+
   base.hash = ''
   // Credentials are always supplied by the server-owned target. A browser
   // must not be able to replace them through a stale query string.
-  base.searchParams.delete('token')
-  base.searchParams.delete('ticket')
+
+  if (!authenticatedWebsocketUrl) {
+    base.searchParams.delete('token')
+    base.searchParams.delete('ticket')
+  }
 
   // The loopback gateway authenticates /api/ws with its query token (the HTTP
   // API accepts the session-token header, but the WebSocket handshake does not).
   // Add the server-owned credential only to this private upstream URL; it is
   // never sent back in the browser-facing response or descriptor.
-  if (includeWebsocketToken) {
+  if (includeWebsocketToken && !authenticatedWebsocketUrl) {
     base.searchParams.set('token', target.token)
   }
 
   return base
 }
 
-function proxyHeaders(request: IncomingMessage, target: URL): Record<string, string | string[]> {
+function proxyHeaders(
+  request: IncomingMessage,
+  target: URL,
+  gateway: PreloadWebGatewayProxy
+): Record<string, string | string[]> {
   const headers: Record<string, string | string[]> = {}
 
   for (const [name, value] of Object.entries(request.headers)) {
     if (
       value === undefined ||
-      ['connection', 'content-length', 'cookie', 'host', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'].includes(name)
+      ['authorization', 'connection', 'content-length', 'cookie', 'host', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'x-hermes-session-token'].includes(name)
     ) {
       continue
     }
@@ -282,9 +311,15 @@ function proxyHeaders(request: IncomingMessage, target: URL): Record<string, str
     headers[name] = value
   }
 
+  for (const [name, value] of Object.entries(gateway.headers || {})) {
+    if (value !== undefined) {
+      headers[name.toLowerCase()] = value
+    }
+  }
+
   headers.host = target.host
   headers.origin = target.origin
-  headers['x-hermes-session-token'] = ''
+  headers['x-hermes-session-token'] = gateway.token
 
   return headers
 }
@@ -306,8 +341,7 @@ function proxyHttp(
     return
   }
 
-  const headers = proxyHeaders(request, destination)
-  headers['x-hermes-session-token'] = target.token
+  const headers = proxyHeaders(request, destination, target)
   const client = destination.protocol === 'https:' ? httpsRequest : httpRequest
 
   const upstream = client(
@@ -335,8 +369,18 @@ function proxyHttp(
   request.pipe(upstream)
 }
 
-function websocketProxyHeaders(request: IncomingMessage, target: URL, key: string, token: string): string {
-  const lines = [`GET ${target.pathname}${target.search} HTTP/1.1`, `Host: ${target.host}`, 'Upgrade: websocket', 'Connection: Upgrade', `Sec-WebSocket-Key: ${key}`, 'Sec-WebSocket-Version: 13', `Origin: ${target.origin}`, `X-Hermes-Session-Token: ${token}`]
+function websocketProxyHeaders(request: IncomingMessage, target: URL, key: string, gateway: PreloadWebGatewayProxy): string {
+  const lines = [`GET ${target.pathname}${target.search} HTTP/1.1`, `Host: ${target.host}`, 'Upgrade: websocket', 'Connection: Upgrade', `Sec-WebSocket-Key: ${key}`, 'Sec-WebSocket-Version: 13', `Origin: ${target.origin}`]
+
+  for (const [name, value] of Object.entries(gateway.headers || {})) {
+    if (value !== undefined && !['host', 'origin', 'connection', 'upgrade', 'x-hermes-session-token'].includes(name.toLowerCase())) {
+      lines.push(`${name}: ${value}`)
+    }
+  }
+
+  if (gateway.token) {
+    lines.push(`X-Hermes-Session-Token: ${gateway.token}`)
+  }
 
   for (const name of ['sec-websocket-protocol', 'sec-websocket-extensions', 'user-agent']) {
     const value = request.headers[name]
@@ -347,6 +391,102 @@ function websocketProxyHeaders(request: IncomingMessage, target: URL, key: strin
   }
 
   return `${lines.join('\r\n')}\r\n\r\n`
+}
+
+const MAX_WEBSOCKET_FRAME_BYTES = 16 * 1024 * 1024
+
+function forwardWebsocketFrames(buffer: Buffer, destination: Duplex, maskOutput: boolean): Buffer | null {
+  let remaining = buffer
+
+  while (remaining.length >= 2) {
+    const firstByte = remaining[0]
+    const secondByte = remaining[1]
+    const isMasked = (secondByte & 0x80) !== 0
+    const lengthCode = secondByte & 0x7f
+    let headerLength = 2
+    let payloadLength: number
+
+    if (lengthCode < 126) {
+      payloadLength = lengthCode
+    } else if (lengthCode === 126) {
+      if (remaining.length < 4) {
+        return remaining
+      }
+
+      payloadLength = remaining.readUInt16BE(2)
+      headerLength = 4
+    } else {
+      if (remaining.length < 10) {
+        return remaining
+      }
+
+      const extendedLength = remaining.readBigUInt64BE(2)
+
+      if (extendedLength > BigInt(MAX_WEBSOCKET_FRAME_BYTES)) {
+        return null
+      }
+
+      payloadLength = Number(extendedLength)
+      headerLength = 10
+    }
+
+    if (payloadLength > MAX_WEBSOCKET_FRAME_BYTES) {
+      return null
+    }
+
+    if (isMasked && remaining.length < headerLength + 4) {
+      return remaining
+    }
+
+    const maskLength = isMasked ? 4 : 0
+    const frameLength = headerLength + maskLength + payloadLength
+
+    if (remaining.length < frameLength) {
+      return remaining
+    }
+
+    const mask = isMasked ? remaining.subarray(headerLength, headerLength + 4) : null
+    const payloadStart = headerLength + maskLength
+    const payload = Buffer.from(remaining.subarray(payloadStart, frameLength))
+
+    if (mask) {
+      for (let index = 0; index < payload.length; index += 1) {
+        payload[index] ^= mask[index % 4]
+      }
+    }
+
+    const extendedOutputLength = payload.length < 126 ? 0 : payload.length <= 0xffff ? 2 : 8
+    const outputMask = maskOutput ? randomBytes(4) : null
+    const output = Buffer.alloc(2 + extendedOutputLength + (outputMask ? 4 : 0) + payload.length)
+    output[0] = firstByte
+
+    if (payload.length < 126) {
+      output[1] = (maskOutput ? 0x80 : 0) | payload.length
+    } else if (payload.length <= 0xffff) {
+      output[1] = (maskOutput ? 0x80 : 0) | 126
+      output.writeUInt16BE(payload.length, 2)
+    } else {
+      output[1] = (maskOutput ? 0x80 : 0) | 127
+      output.writeBigUInt64BE(BigInt(payload.length), 2)
+    }
+
+    const outputPayloadStart = 2 + extendedOutputLength
+
+    if (outputMask) {
+      outputMask.copy(output, outputPayloadStart)
+
+      for (let index = 0; index < payload.length; index += 1) {
+        output[outputPayloadStart + 4 + index] = payload[index] ^ outputMask[index % 4]
+      }
+    } else {
+      payload.copy(output, outputPayloadStart)
+    }
+
+    destination.write(output)
+    remaining = remaining.subarray(frameLength)
+  }
+
+  return remaining
 }
 
 function proxyWebsocket(request: IncomingMessage, socket: Duplex, head: Buffer, target: PreloadWebGatewayProxy, host: string): void {
@@ -370,6 +510,8 @@ function proxyWebsocket(request: IncomingMessage, socket: Duplex, head: Buffer, 
   const upstreamKey = randomBytes(16).toString('base64')
   let upstream: Duplex
   let responseBuffer = Buffer.alloc(0)
+  let browserFrameBuffer: Buffer<ArrayBufferLike> = head
+  let upstreamFrameBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0)
   let established = false
   let handshakeSent = false
 
@@ -379,7 +521,7 @@ function proxyWebsocket(request: IncomingMessage, socket: Duplex, head: Buffer, 
     }
 
     handshakeSent = true
-    upstream.write(websocketProxyHeaders(request, destination, upstreamKey, target.token))
+    upstream.write(websocketProxyHeaders(request, destination, upstreamKey, target))
   }
 
   upstream =
@@ -388,12 +530,41 @@ function proxyWebsocket(request: IncomingMessage, socket: Duplex, head: Buffer, 
       : netConnect({ host: destination.hostname, port: Number(destination.port) || 80 }, sendHandshake)
 
   const fail = () => {
-    if (!established) {
-      socket.destroy()
-    }
-
+    socket.destroy()
     upstream.destroy()
   }
+
+  const flushBrowserFrames = () => {
+    const remaining = forwardWebsocketFrames(browserFrameBuffer, upstream, true)
+
+    if (remaining === null) {
+      fail()
+
+      return
+    }
+
+    browserFrameBuffer = remaining
+  }
+
+  const flushUpstreamFrames = () => {
+    const remaining = forwardWebsocketFrames(upstreamFrameBuffer, socket, false)
+
+    if (remaining === null) {
+      fail()
+
+      return
+    }
+
+    upstreamFrameBuffer = remaining
+  }
+
+  socket.on('data', chunk => {
+    browserFrameBuffer = Buffer.concat([browserFrameBuffer, chunk])
+
+    if (established) {
+      flushBrowserFrames()
+    }
+  })
 
   if (destination.protocol === 'https:') {
     upstream.once('secureConnect', sendHandshake)
@@ -401,7 +572,8 @@ function proxyWebsocket(request: IncomingMessage, socket: Duplex, head: Buffer, 
 
   upstream.on('data', chunk => {
     if (established) {
-      socket.write(chunk)
+      upstreamFrameBuffer = Buffer.concat([upstreamFrameBuffer, chunk])
+      flushUpstreamFrames()
 
       return
     }
@@ -435,15 +607,11 @@ function proxyWebsocket(request: IncomingMessage, socket: Duplex, head: Buffer, 
     const remainder = responseBuffer.subarray(headerEnd + 4)
 
     if (remainder.length) {
-      socket.write(remainder)
+      upstreamFrameBuffer = Buffer.concat([upstreamFrameBuffer, remainder])
     }
 
-    if (head.length) {
-      upstream.write(head)
-    }
-
-    socket.pipe(upstream)
-    upstream.pipe(socket)
+    flushUpstreamFrames()
+    flushBrowserFrames()
   })
   upstream.once('error', fail)
   upstream.once('close', () => {
