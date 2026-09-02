@@ -5,7 +5,7 @@ import { connect as netConnect } from 'node:net'
 
 import { describe, expect, it } from 'vitest'
 
-import { createPreloadBridge } from './preload-web'
+import { createPreloadBridge, startPreloadWebServer } from './preload-web'
 
 function postJson(port: number, path: string, payload: unknown, origin: string) {
   return new Promise<{ status: number; body: any }>((resolve, reject) => {
@@ -38,6 +38,57 @@ function postJson(port: number, path: string, payload: unknown, origin: string) 
 }
 
 describe('preload bridge', () => {
+  it('starts in the preload process and forwards requests through ipcRenderer', async () => {
+    const calls: Array<{ method: string; channel: string; args: unknown[] }> = []
+    const listeners = new Map<string, (...args: unknown[]) => void>()
+
+    const ipc = {
+      invoke: async (channel: string, ...args: unknown[]) => {
+        calls.push({ method: 'invoke', channel, args })
+
+        return { ok: true }
+      },
+      send: (channel: string, ...args: unknown[]) => {
+        calls.push({ method: 'send', channel, args })
+      },
+      on: (channel: string, listener: (...args: unknown[]) => void) => {
+        listeners.set(channel, listener)
+      }
+    }
+
+    const server = startPreloadWebServer(ipc, { host: '127.0.0.1', port: 0 })
+    const address = await server.ready
+
+    try {
+      const invoke = await postJson(
+        address.port,
+        '/web-api/invoke',
+        { channel: 'hermes:connection', args: ['work'] },
+        `http://${address.host}:${address.port}`
+      )
+
+      const send = await postJson(
+        address.port,
+        '/web-api/send',
+        { channel: 'hermes:test', args: [{ ok: true }] },
+        `http://${address.host}:${address.port}`
+      )
+
+      expect(invoke.body).toEqual({ ok: true, result: { ok: true } })
+      expect(send.body).toEqual({ ok: true })
+      expect(calls).toEqual([
+        { method: 'invoke', channel: 'hermes:connection', args: ['work'] },
+        { method: 'send', channel: 'hermes:test', args: [{ ok: true }] }
+      ])
+      expect(listeners.has('hermes:boot-progress')).toBe(true)
+      expect(listeners.has('hermes:bootstrap:event')).toBe(true)
+      expect(listeners.has('hermes:updates:progress')).toBe(true)
+      expect(listeners.has('hermes:backend-exit')).toBe(true)
+    } finally {
+      await server.bridge.stop()
+    }
+  })
+
   it('dispatches browser invoke and send requests through the supplied handlers', async () => {
     const calls: Array<{ kind: string; channel: string; args: unknown[] }> = []
 

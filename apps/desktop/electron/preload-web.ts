@@ -1,10 +1,9 @@
 /**
  * HTTP/WebSocket bridge for the browser-side `preload-api-client.ts` adapter.
  *
- * The main process supplies the two dispatch callbacks.  Keeping dispatch
- * injected avoids duplicating Electron IPC handlers and makes this module
- * usable with the existing main process without coupling it to one particular
- * handler registry.
+ * The preload supplies the two dispatch callbacks through ipcRenderer. Keeping
+ * dispatch injected avoids duplicating Electron IPC handlers and keeps all
+ * HTTP/WebSocket-server logic in this renderer-side module.
  */
 
 import { createHash } from 'node:crypto'
@@ -12,8 +11,19 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Duplex } from 'node:stream'
 
 const DEFAULT_HOST = '127.0.0.1'
+const DEFAULT_PORT = 13043
 const DEFAULT_MAX_BODY_BYTES = 1 * 1024 * 1024
 const WEBSOCKET_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+// These are existing Electron event channels sent to the hidden renderer by
+// main-web.ts. The web server subscribes to them here and republishes them to
+// browser WebSocket clients; main-web.ts remains unaware of the HTTP bridge.
+const PRELOAD_EVENT_CHANNELS = [
+  'hermes:boot-progress',
+  'hermes:bootstrap:event',
+  'hermes:updates:progress',
+  'hermes:backend-exit'
+] as const
 
 export interface PreloadBridgeContext {
   kind: 'invoke' | 'send'
@@ -43,6 +53,22 @@ export interface PreloadBridge {
   start(): Promise<PreloadBridgeAddress>
   stop(): Promise<void>
   emit(channel: string, ...args: unknown[]): void
+}
+
+export interface PreloadWebIpcRenderer {
+  invoke(channel: string, ...args: unknown[]): Promise<unknown>
+  send(channel: string, ...args: unknown[]): void
+  on(channel: string, listener: (...args: unknown[]) => void): unknown
+}
+
+export interface PreloadWebServer {
+  bridge: PreloadBridge
+  ready: Promise<PreloadBridgeAddress>
+}
+
+export interface PreloadWebServerOptions {
+  host?: string
+  port?: number
 }
 
 interface BridgeRequest {
@@ -420,4 +446,63 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
       }
     }
   }
+}
+
+function configuredHost(): string {
+  const host = process.env.HERMES_DESKTOP_WEB_HOST?.trim()
+
+  return host || DEFAULT_HOST
+}
+
+function configuredPort(): number {
+  const port = Number.parseInt(process.env.HERMES_DESKTOP_WEB_PORT || String(DEFAULT_PORT), 10)
+
+  return Number.isInteger(port) && port >= 0 && port <= 65535 ? port : DEFAULT_PORT
+}
+
+/**
+ * Start the browser bridge in this preload's renderer process.
+ *
+ * Requests stay on the existing Electron IPC surface: the browser-facing
+ * server never receives a main-process object or handler table. It forwards
+ * each request through ipcRenderer, and the existing ipcMain handlers receive
+ * those calls without knowing that an HTTP server is present.
+ */
+export function startPreloadWebServer(
+  ipc: PreloadWebIpcRenderer,
+  options: PreloadWebServerOptions = {}
+): PreloadWebServer {
+  const bridge = createPreloadBridge({
+    host: options.host || configuredHost(),
+    port: options.port ?? configuredPort(),
+    invoke: (channel, args) => ipc.invoke(channel, ...args),
+    send: (channel, args) => {
+      ipc.send(channel, ...args)
+    }
+  })
+
+  for (const channel of PRELOAD_EVENT_CHANNELS) {
+    ipc.on(channel, (_event, ...args) => {
+      bridge.emit(channel, ...args)
+    })
+  }
+
+  const ready = bridge.start()
+
+  return { bridge, ready }
+}
+
+// This file is loaded as a hidden Electron preload, not as the browser client
+// and not as a unit-test module. Keep the startup here so the HTTP listener is
+// guaranteed to live in the renderer process that owns ipcRenderer.
+if (process.versions.electron) {
+  // `require` is intentional: this source is bundled as CommonJS for Electron
+  // preload execution, while importing it directly in Node-based tests must
+  // not try to initialise Electron's native module.
+  const { ipcRenderer } = require('electron') as { ipcRenderer: PreloadWebIpcRenderer }
+  const server = startPreloadWebServer(ipcRenderer)
+
+  void server.ready.catch(error => {
+    console.error('[desktop-web] failed to start web server', error)
+  })
 }
