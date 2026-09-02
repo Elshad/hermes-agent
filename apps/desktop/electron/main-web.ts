@@ -471,7 +471,7 @@ let f12Blocked = false
 // ESM loader is broken on Electron 40's Node (ERR_INVALID_RETURN_PROPERTY_VALUE).
 // Dev (`npm run dev`) and prod both load the esbuild output from dist/.
 const PRELOAD_PATH = path.join(APP_ROOT, 'dist', 'electron-preload.js')
-const PRELOAD_WEB_PATH = path.join(APP_ROOT, 'dist', 'electron-preload-web.js')
+const PRELOAD_WEB_PATH = path.join(APP_ROOT, 'dist', 'electron-preload-web.cjs')
 
 // Remote displays (SSH X11 forwarding, VNC, RDP) make Chromium's GPU
 // compositor flicker — accelerated layers can't be presented cleanly over the

@@ -800,6 +800,6 @@ const hermesDesktop = {
 
 // When bundled as a browser script, expose both the compatibility transport and
 // the unchanged Desktop API expected by the renderer.
-if (typeof window !== 'undefined') {
+if (typeof window !== 'undefined' && !(window as Window & { hermesDesktop?: unknown }).hermesDesktop) {
   Object.assign(window, { ipcRenderer, hermesDesktop })
 }

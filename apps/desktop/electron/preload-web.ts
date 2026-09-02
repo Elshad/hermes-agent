@@ -7,7 +7,10 @@
  */
 
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { readFile, stat } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Duplex } from 'node:stream'
 
 const DEFAULT_HOST = '127.0.0.1'
@@ -41,6 +44,10 @@ export interface PreloadBridgeOptions {
   maxBodyBytes?: number
   /** Explicit browser origins allowed to call the loopback HTTP bridge. */
   allowedOrigins?: string[]
+  /** Directory containing the shared Vite renderer build. */
+  staticRoot?: string
+  /** Browser bridge script to inject into the served renderer HTML. */
+  browserBridgePath?: string
 }
 
 export interface PreloadBridgeAddress {
@@ -69,6 +76,9 @@ export interface PreloadWebServer {
 export interface PreloadWebServerOptions {
   host?: string
   port?: number
+  staticRoot?: string
+  allowedOrigins?: string[]
+  browserBridgePath?: string
 }
 
 interface BridgeRequest {
@@ -109,6 +119,168 @@ function errorMessage(error: unknown): { message: string; name: string } {
   }
 
   return { message: String(error), name: 'Error' }
+}
+
+const CONTENT_TYPES: Record<string, string> = {
+  '.css': 'text/css; charset=utf-8',
+  '.gif': 'image/gif',
+  '.html': 'text/html; charset=utf-8',
+  '.ico': 'image/x-icon',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2'
+}
+
+function unsafeRequestPath(rawUrl: string): boolean {
+  const rawPath = rawUrl.split('?')[0]
+  let decodedPath: string
+
+  try {
+    decodedPath = decodeURIComponent(rawPath)
+  } catch {
+    return true
+  }
+
+  return decodedPath.includes('\u0000') || decodedPath.split(/[\\/]/).includes('..')
+}
+
+function staticFilePath(staticRoot: string, pathname: string): string | null {
+  let decodedPath: string
+
+  try {
+    decodedPath = decodeURIComponent(pathname)
+  } catch {
+    return null
+  }
+
+  if (decodedPath.includes('\u0000')) {
+    return null
+  }
+
+  const root = resolve(staticRoot)
+  const candidate = resolve(root, decodedPath.replace(/^\/+/, '') || 'index.html')
+  const outsideRoot = relative(root, candidate)
+
+  if (outsideRoot === '..' || outsideRoot.startsWith(`..${sep}`) || isAbsolute(outsideRoot)) {
+    return null
+  }
+
+  return candidate
+}
+
+function injectBrowserBridge(html: Buffer, browserBridgePath: string): Buffer {
+  const source = `    <script type="module" src="${browserBridgePath}"></script>\n`
+  const text = html.toString('utf8')
+
+  if (text.includes(`src="${browserBridgePath}"`)) {
+    return html
+  }
+
+  const headEnd = text.indexOf('</head>')
+
+  if (headEnd < 0) {
+    return Buffer.from(`${source}${text}`, 'utf8')
+  }
+
+  return Buffer.from(`${text.slice(0, headEnd)}${source}${text.slice(headEnd)}`, 'utf8')
+}
+
+async function serveStatic(
+  request: IncomingMessage,
+  response: ServerResponse,
+  staticRoot: string,
+  pathname: string,
+  browserBridgePath: string | undefined
+): Promise<boolean> {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return false
+  }
+
+  const requested = staticFilePath(staticRoot, pathname)
+
+  if (!requested) {
+    response.statusCode = 400
+    response.end('Bad request')
+
+    return true
+  }
+
+  let filePath = requested
+  let fileStat
+
+  try {
+    fileStat = await stat(filePath)
+
+    if (fileStat.isDirectory()) {
+      filePath = join(filePath, 'index.html')
+      fileStat = await stat(filePath)
+    }
+  } catch {
+    let decodedPath: string
+
+    try {
+      decodedPath = decodeURIComponent(pathname)
+    } catch {
+      response.statusCode = 400
+      response.end('Bad request')
+
+      return true
+    }
+
+    // HashRouter normally keeps routes in the URL fragment. This fallback also
+    // lets direct extensionless browser routes resolve to the same Desktop UI.
+    if (extname(decodedPath)) {
+      response.statusCode = 404
+      response.end('Not found')
+
+      return true
+    }
+
+    filePath = staticFilePath(staticRoot, '/') || requested
+
+    try {
+      fileStat = await stat(filePath)
+    } catch {
+      return false
+    }
+  }
+
+  if (!fileStat.isFile()) {
+    response.statusCode = 404
+    response.end('Not found')
+
+    return true
+  }
+
+  let body: Buffer | undefined
+
+  if (browserBridgePath && filePath === join(resolve(staticRoot), 'index.html')) {
+    body = injectBrowserBridge(await readFile(filePath), browserBridgePath)
+  }
+
+  response.statusCode = 200
+  response.setHeader('Content-Type', CONTENT_TYPES[extname(filePath).toLowerCase()] || 'application/octet-stream')
+  response.setHeader('Content-Length', body?.length ?? fileStat.size)
+  response.setHeader(
+    'Cache-Control',
+    filePath.endsWith('index.html') ? 'no-cache' : 'public, max-age=31536000, immutable'
+  )
+
+  if (request.method === 'HEAD') {
+    response.end()
+  } else {
+    response.end(body ?? (await readFile(filePath)))
+  }
+
+  return true
 }
 
 function websocketFrame(opcode: number, payload: Buffer): Buffer {
@@ -264,6 +436,8 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
   const sendPath = `${webApiPath}/send`
   const maxBodyBytes = options.maxBodyBytes || DEFAULT_MAX_BODY_BYTES
   const allowedOrigins = new Set(options.allowedOrigins || [])
+  const staticRoot = options.staticRoot ? resolve(options.staticRoot) : null
+  const browserBridgePath = options.browserBridgePath
   const clients = new Set<EventSocket>()
 
   function allowedOrigin(request: IncomingMessage): string | undefined {
@@ -290,6 +464,12 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
   }
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (unsafeRequestPath(request.url || '/')) {
+      jsonResponse(response, 400, { ok: false, error: { message: 'Bad request', name: 'BadRequest' } })
+
+      return
+    }
+
     const url = new URL(request.url || '/', `http://${request.headers.host || `${host}:${options.port || 0}`}`)
     const origin = request.headers.origin
     const responseOrigin = allowedOrigin(request)
@@ -320,6 +500,12 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
       jsonResponse(response, 200, { ok: true }, responseOrigin)
 
       return
+    }
+
+    if (staticRoot && !url.pathname.startsWith(webApiPath)) {
+      if (await serveStatic(request, response, staticRoot, url.pathname, browserBridgePath)) {
+        return
+      }
     }
 
     if (request.method !== 'POST' || ![invokePath, sendPath].includes(url.pathname)) {
@@ -460,6 +646,18 @@ function configuredPort(): number {
   return Number.isInteger(port) && port >= 0 && port <= 65535 ? port : DEFAULT_PORT
 }
 
+function defaultStaticRoot(): string | undefined {
+  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath
+
+  const candidates = [
+    process.env.HERMES_DESKTOP_WEB_DIST,
+    resourcesPath ? join(resourcesPath, 'app.asar.unpacked', 'dist') : undefined,
+    typeof __dirname === 'string' ? __dirname : undefined
+  ]
+
+  return candidates.find(candidate => candidate && existsSync(join(candidate, 'index.html')))
+}
+
 /**
  * Start the browser bridge in this preload's renderer process.
  *
@@ -475,6 +673,9 @@ export function startPreloadWebServer(
   const bridge = createPreloadBridge({
     host: options.host || configuredHost(),
     port: options.port ?? configuredPort(),
+    staticRoot: options.staticRoot || defaultStaticRoot(),
+    browserBridgePath: options.browserBridgePath || '/electron-preload-api-client.js',
+    allowedOrigins: options.allowedOrigins,
     invoke: (channel, args) => ipc.invoke(channel, ...args),
     send: (channel, args) => {
       ipc.send(channel, ...args)

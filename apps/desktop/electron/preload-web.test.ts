@@ -1,7 +1,10 @@
 import { randomBytes } from 'node:crypto'
 import { once } from 'node:events'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { request as httpRequest } from 'node:http'
 import { connect as netConnect } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
@@ -35,6 +38,35 @@ function postJson(port: number, path: string, payload: unknown, origin: string) 
     request.on('error', reject)
     request.end(JSON.stringify(payload))
   })
+}
+
+function getText(port: number, path: string, origin?: string) {
+  return new Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string }>(
+    (resolve, reject) => {
+      const request = httpRequest(
+        {
+          host: '127.0.0.1',
+          port,
+          path,
+          method: 'GET',
+          headers: origin ? { Origin: origin } : undefined
+        },
+        response => {
+          let body = ''
+          response.setEncoding('utf8')
+          response.on('data', chunk => {
+            body += chunk
+          })
+          response.on('end', () => {
+            resolve({ status: response.statusCode || 0, headers: response.headers, body })
+          })
+        }
+      )
+
+      request.on('error', reject)
+      request.end()
+    }
+  )
 }
 
 describe('preload bridge', () => {
@@ -132,6 +164,50 @@ describe('preload bridge', () => {
       ])
     } finally {
       await bridge.stop()
+    }
+  })
+
+  it('serves the shared renderer build and keeps the API namespace separate', async () => {
+    const staticRoot = await mkdtemp(join(tmpdir(), 'hermes-desktop-web-'))
+    const index = '<!doctype html><html><body>Desktop UI</body></html>'
+
+    await mkdir(join(staticRoot, 'assets'))
+    await writeFile(join(staticRoot, 'index.html'), index)
+    await writeFile(join(staticRoot, 'assets', 'app.js'), 'console.log("desktop")')
+    await writeFile(join(staticRoot, 'outside.txt'), 'must not be exposed')
+
+    const bridge = createPreloadBridge({
+      host: '127.0.0.1',
+      port: 0,
+      staticRoot,
+      browserBridgePath: '/electron-preload-api-client.js',
+      invoke: async () => undefined,
+      send: async () => undefined
+    })
+
+    const address = await bridge.start()
+
+    try {
+      const origin = `http://127.0.0.1:${address.port}`
+      const root = await getText(address.port, '/', origin)
+      const asset = await getText(address.port, '/assets/app.js', origin)
+      const route = await getText(address.port, '/settings', origin)
+      const traversal = await getText(address.port, '/%2e%2e/outside.txt', origin)
+      const api = await getText(address.port, '/web-api/health', origin)
+
+      expect(root.status).toBe(200)
+      expect(root.body).toContain('<script type="module" src="/electron-preload-api-client.js"></script>')
+      expect(root.body).toContain('Desktop UI')
+      expect(root.headers['content-type']).toContain('text/html')
+      expect(asset).toMatchObject({ status: 200, body: 'console.log("desktop")' })
+      expect(route).toMatchObject({ status: 200 })
+      expect(route.body).toContain('Desktop UI')
+      expect(traversal.status).toBe(400)
+      expect(traversal.body).toContain('Bad request')
+      expect(api).toEqual(expect.objectContaining({ status: 200, body: '{"ok":true}' }))
+    } finally {
+      await bridge.stop()
+      await rm(staticRoot, { recursive: true, force: true })
     }
   })
 
