@@ -29,6 +29,16 @@ interface WebApiEvent {
   data?: unknown
 }
 
+interface HermesApiRequest {
+  path: string
+  method?: string
+  body?: unknown
+  upload?: { filename: string; contentType?: string; bytes: ArrayBuffer }
+  timeoutMs?: number
+  profile?: string | null
+  connectionId?: string | null
+}
+
 interface WebClientWindow extends Window {
   __HERMES_WEB_API_BASE__?: string
   ipcRenderer?: typeof ipcRenderer
@@ -489,7 +499,7 @@ const hermesDesktop = {
     remember: name => ipcRenderer.invoke('hermes:profile:remember', name),
     set: name => ipcRenderer.invoke('hermes:profile:set', name)
   },
-  api: request => ipcRenderer.invoke('hermes:api', request),
+  api: <T>(request: HermesApiRequest) => ipcRenderer.invoke<T>('hermes:api', request),
   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
   readWindowBelow: () => ipcRenderer.invoke('hermes:window:readBelow'),

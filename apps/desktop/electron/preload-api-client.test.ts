@@ -5,6 +5,7 @@ import { afterEach, test, vi } from 'vitest'
 type WebDesktopWindow = Window & {
   hermesDesktop?: {
     getConnection: (profile: unknown) => Promise<unknown>
+    api: <T>(request: unknown) => Promise<T>
   }
 }
 
@@ -29,9 +30,23 @@ test('exposes hermesDesktop and routes getConnection through web-api invoke', as
     assert.equal(init?.method, 'POST')
     assert.equal(init?.credentials, 'include')
     assert.deepEqual(init?.headers, { 'Content-Type': 'application/json' })
-    assert.deepEqual(JSON.parse(String(init?.body)), {
-      channel: 'hermes:connection',
-      args: ['work']
+
+    const request = JSON.parse(String(init?.body))
+    if (request.channel === 'hermes:connection') {
+      assert.deepEqual(request, {
+        channel: 'hermes:connection',
+        args: ['work']
+      })
+
+      return new Response(JSON.stringify({ ok: true, result: { profile: 'work' } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    }
+
+    assert.deepEqual(request, {
+      channel: 'hermes:api',
+      args: [{ path: '/api/config' }]
     })
 
     return new Response(JSON.stringify({ ok: true, result: { profile: 'work' } }), {
@@ -46,6 +61,7 @@ test('exposes hermesDesktop and routes getConnection through web-api invoke', as
 
   const desktop = (globalThis.window as WebDesktopWindow).hermesDesktop
   assert.ok(desktop)
-  assert.deepEqual(await desktop.getConnection('work'), { profile: 'work' })
-  assert.equal(fetchMock.mock.calls.length, 1)
+  assert.deepEqual(await desktop!.getConnection('work'), { profile: 'work' })
+  assert.deepEqual(await desktop!.api<{ profile: string }>({ path: '/api/config' }), { profile: 'work' })
+  assert.equal(fetchMock.mock.calls.length, 2)
 })
