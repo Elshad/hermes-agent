@@ -439,7 +439,7 @@ import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
-import { MyIpcMain } from "./preload-web-helper";
+import { MyIpcMain } from './preload-web-helper'
 
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
@@ -483,7 +483,28 @@ let preloadWebServerProcess: ChildProcess | null = null
 let preloadWebServerAddress: PreloadWebServerAddress | null = null
 let preloadWebServerStart: Promise<PreloadWebServerAddress> | null = null
 let preloadWebServerReady: PendingPreloadWebServerStart | null = null
-let ipcMainWeb: MyIpcMain | null = null
+let preloadWebIpcMessageHandler: ((message: unknown) => void) | null = null
+
+const preloadWebChildProxy = {
+  on(event: string, listener: (message: unknown) => void) {
+    if (event === 'message') {
+      preloadWebIpcMessageHandler = listener
+    }
+
+    return preloadWebChildProxy
+  },
+  send(message: unknown, callback?: (error?: Error | null) => void) {
+    if (!preloadWebServerProcess) {
+      callback?.(new Error('Desktop-Web web server child is unavailable'))
+
+      return false
+    }
+
+    return preloadWebServerProcess.send(message as any, callback)
+  }
+} as unknown as ChildProcess
+
+const ipcMainWeb = new MyIpcMain(preloadWebChildProxy)
 
 function parseWebPort(value: string | undefined): number {
   const port = Number(value)
@@ -500,6 +521,33 @@ const WEB_ALLOWED_ORIGINS = (process.env.HERMES_DESKTOP_WEB_ALLOWED_ORIGINS || '
   .filter(Boolean)
 
 const PRELOAD_WEB_SERVER_PATH = desktopDistArtifact('electron-preload-web.js')
+
+function handlePreloadWebServerMessage(message: unknown): void {
+  if (
+    message &&
+    typeof message === 'object' &&
+    'type' in message &&
+    message.type === 'ready' &&
+    'host' in message &&
+    typeof message.host === 'string' &&
+    'port' in message &&
+    typeof message.port === 'number'
+  ) {
+    const address = { host: message.host, port: message.port }
+    preloadWebServerAddress = address
+    preloadWebServerReady?.resolve(address)
+    preloadWebServerReady = null
+
+    return
+  }
+
+  preloadWebIpcMessageHandler?.(message)
+}
+
+function failPreloadWebServerStart(error: unknown): void {
+  preloadWebServerReady?.reject(error)
+  preloadWebServerReady = null
+}
 
 function startPreloadWebServer(): Promise<PreloadWebServerAddress> {
   if (preloadWebServerAddress) {
@@ -527,7 +575,6 @@ function startPreloadWebServer(): Promise<PreloadWebServerAddress> {
     })
 
     preloadWebServerProcess = child
-    ipcMainWeb = new MyIpcMain(child);
     child.on('message', handlePreloadWebServerMessage)
     child.once('error', error => {
       failPreloadWebServerStart(error)
@@ -540,7 +587,6 @@ function startPreloadWebServer(): Promise<PreloadWebServerAddress> {
       }
 
       preloadWebServerProcess = null
-      ipcMainWeb = nil
       preloadWebServerAddress = null
       preloadWebServerStart = null
     })
@@ -577,7 +623,6 @@ function stopPreloadWebServer(): Promise<void> {
     child.once('exit', finish)
 
     preloadWebServerProcess = null
-    ipcMainWeb = nil
     preloadWebServerAddress = null
     preloadWebServerStart = null
     failPreloadWebServerStart(error)
@@ -17644,7 +17689,7 @@ app.on('before-quit', event => {
   if (heldQuitForActiveWork(event)) {
     return
   }
-  
+
   void stopPreloadWebServer()
 
   // A detached remote updater can outlive this Electron process. Do not tear
