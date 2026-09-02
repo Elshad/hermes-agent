@@ -8,8 +8,11 @@
  */
 
 import { createHash } from 'node:crypto'
+import { createReadStream, readFileSync, statSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { extname, join, relative, resolve, sep } from 'node:path'
 import type { Duplex } from 'node:stream'
+
 import { MyIpcRenderer } from './preload-web-helper'
 
 export const ipcRendererWeb = new MyIpcRenderer()
@@ -32,6 +35,8 @@ export interface PreloadWebServerOptions {
   port?: number
   webApiPath?: string
   maxBodyBytes?: number
+  /** Built Desktop renderer directory served at the browser-facing root. */
+  staticDir?: string
   /** Explicit browser origins allowed to call the loopback HTTP server. */
   allowedOrigins?: string[]
 }
@@ -250,6 +255,131 @@ function validateRequest(payload: WebApiRequest): { channel: string; args: unkno
   return { channel: payload.channel, args: payload.args }
 }
 
+const STATIC_CONTENT_TYPES: Record<string, string> = {
+  '.css': 'text/css; charset=utf-8',
+  '.gif': 'image/gif',
+  '.html': 'text/html; charset=utf-8',
+  '.ico': 'image/x-icon',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8',
+  '.wasm': 'application/wasm',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2'
+}
+
+function staticFilePath(staticDir: string, pathname: string): string | null {
+  let decodedPath: string
+
+  try {
+    decodedPath = decodeURIComponent(pathname)
+  } catch {
+    return null
+  }
+
+  if (decodedPath.includes('\0')) {
+    return null
+  }
+
+  const root = resolve(staticDir)
+  const candidate = resolve(root, `.${decodedPath}`)
+  const candidateRelative = relative(root, candidate)
+
+  if (candidateRelative === '..' || candidateRelative.startsWith(`..${sep}`)) {
+    return null
+  }
+
+  return candidate
+}
+
+async function serveStatic(
+  request: IncomingMessage,
+  response: ServerResponse,
+  pathname: string,
+  staticDir: string | undefined
+): Promise<boolean> {
+  if (!staticDir || !['GET', 'HEAD'].includes(request.method || '')) {
+    return false
+  }
+
+  let decodedPath: string
+
+  try {
+    decodedPath = decodeURIComponent(pathname)
+  } catch {
+    response.statusCode = 400
+    response.end('Bad request')
+
+    return true
+  }
+
+  let filePath = staticFilePath(staticDir, pathname)
+
+  if (!filePath) {
+    response.statusCode = 400
+    response.end('Bad request')
+
+    return true
+  }
+
+  try {
+    if (!statSync(filePath).isFile()) {
+      filePath = join(filePath, 'index.html')
+    }
+
+    if (!statSync(filePath).isFile()) {
+      throw new Error('not a file')
+    }
+  } catch {
+    // Client-side routes such as `/chat` are handled by the same renderer
+    // entrypoint. Do not turn missing asset requests (`.js`, `.css`, etc.)
+    // into HTML, because that hides broken bundles behind a misleading MIME
+    // error in the browser.
+    if (extname(decodedPath)) {
+      return false
+    }
+
+    filePath = join(resolve(staticDir), 'index.html')
+
+    try {
+      if (!statSync(filePath).isFile()) {
+        return false
+      }
+    } catch {
+      return false
+    }
+  }
+
+  const contentType = STATIC_CONTENT_TYPES[extname(filePath).toLowerCase()] || 'application/octet-stream'
+  response.statusCode = 200
+  response.setHeader('Content-Type', contentType)
+  response.setHeader('Cache-Control', extname(filePath) === '.html' ? 'no-cache' : 'public, max-age=31536000')
+
+  if (request.method === 'HEAD') {
+    response.end()
+  } else if (extname(filePath).toLowerCase() === '.html') {
+    const html = readFileSync(filePath, 'utf8')
+    const bridgeScript = '<script src="/electron-preload-api-client.js"></script>'
+
+    const body = html.includes(bridgeScript)
+      ? html
+      : html.replace(/<\/head>/i, `  ${bridgeScript}\n</head>`)
+
+    response.setHeader('Content-Length', Buffer.byteLength(body))
+    response.end(body)
+  } else {
+    createReadStream(filePath).pipe(response)
+  }
+
+  return true
+}
+
 export function createPreloadWebServer(options: PreloadWebServerOptions): PreloadWebServer {
   const host = options.host || DEFAULT_HOST
   const webApiPath = normalizePath(options.webApiPath || '/web-api')
@@ -260,11 +390,14 @@ export function createPreloadWebServer(options: PreloadWebServerOptions): Preloa
   const allowedOrigins = new Set(options.allowedOrigins || [])
   const clients = new Set<EventSocket>()
   const invoke = options.invoke || ((channel: string, args: unknown[]) => ipcRendererWeb.invoke(channel, ...args))
+
   const send =
     options.send ||
     ((channel: string, args: unknown[]) => {
       ipcRendererWeb.send(channel, ...args)
     })
+
+  const staticDir = options.staticDir
 
   function allowedOrigin(request: IncomingMessage): string | undefined {
     const origin = request.headers.origin
@@ -319,6 +452,10 @@ export function createPreloadWebServer(options: PreloadWebServerOptions): Preloa
     if (request.method === 'GET' && url.pathname === `${webApiPath}/health`) {
       jsonResponse(response, 200, { ok: true }, responseOrigin)
 
+      return
+    }
+
+    if (!url.pathname.startsWith(webApiPath) && (await serveStatic(request, response, url.pathname, staticDir))) {
       return
     }
 
@@ -502,6 +639,7 @@ export async function runPreloadWebServerProcess(): Promise<void> {
   const webServer = createPreloadWebServer({
     host: process.env.HERMES_DESKTOP_WEB_HOST || DEFAULT_HOST,
     port: childPort(),
+    staticDir: process.env.HERMES_DESKTOP_WEB_DIST,
     allowedOrigins: childAllowedOrigins()
   })
 
