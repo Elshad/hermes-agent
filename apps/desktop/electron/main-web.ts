@@ -1380,6 +1380,8 @@ function registerMediaProtocol() {
 
 let nativeWindow = null
 let mainWindow = null
+let nativeWindowRecoveryScheduled = false
+let nativeWindowQuitRequested = false
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -1836,7 +1838,23 @@ function clampBootProgress(value) {
   return Math.max(0, Math.min(100, Math.round(numeric)))
 }
 
+function sendNativeWindowEvent(channel, ...args) {
+  if (!nativeWindow || nativeWindow.isDestroyed()) {
+    return
+  }
+
+  const { webContents } = nativeWindow
+
+  if (!webContents || webContents.isDestroyed()) {
+    return
+  }
+
+  webContents.send(channel, ...args)
+}
+
 function broadcastBootProgress() {
+  sendNativeWindowEvent('hermes:boot-progress', bootProgressState)
+
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
   }
@@ -1942,6 +1960,8 @@ function broadcastBootstrapEvent(ev) {
   } else if (ev.type === 'dismissed') {
     resetBootstrapSnapshot()
   }
+
+  sendNativeWindowEvent('hermes:bootstrap:event', ev)
 
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
@@ -2869,6 +2889,7 @@ async function getOriginUrl(updateRoot) {
 function emitUpdateProgress(payload) {
   const merged = { stage: 'idle', message: '', percent: null, error: null, ...payload, at: Date.now() }
   rememberLog(`[updates] ${merged.stage}: ${merged.message || merged.error || ''}`)
+  sendNativeWindowEvent('hermes:updates:progress', merged)
 
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send('hermes:updates:progress', merged)
@@ -6229,6 +6250,8 @@ function sendBackendExit(payload) {
   if (softRehomeInProgress) {
     return
   }
+
+  sendNativeWindowEvent('hermes:backend-exit', payload)
 
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
@@ -13931,11 +13954,56 @@ function closeQuickEntryWindow() {
   quickEntryWindow = null
 }
 
+function scheduleNativeWindowRecovery(reason: string, lostWindow?: BrowserWindow) {
+  if (nativeWindowQuitRequested || nativeWindowRecoveryScheduled) {
+    return
+  }
+
+  nativeWindowRecoveryScheduled = true
+  nativeWindow = null
+  rememberLog(`[native-window] hidden renderer lost (${reason}); recreating it`)
+
+  if (lostWindow && !lostWindow.isDestroyed()) {
+    lostWindow.destroy()
+  }
+
+  setTimeout(() => {
+    nativeWindowRecoveryScheduled = false
+
+    if (!nativeWindowQuitRequested && (!nativeWindow || nativeWindow.isDestroyed())) {
+      createNativeWindow()
+    }
+  }, 0)
+}
+
 function createNativeWindow() {
-  nativeWindow = new BrowserWindow({
+  const createdNativeWindow = new BrowserWindow({
     show: false,
     skipTaskbar: true,
-    webPreferences: chatWindowWebPreferences(PRELOAD_WEB_PATH)
+    webPreferences: {
+      ...chatWindowWebPreferences(PRELOAD_WEB_PATH),
+      // The web preload owns a Node HTTP server. It is intentionally isolated
+      // from page code, but cannot run Node networking inside Electron's
+      // sandboxed preload environment.
+      sandbox: false
+    }
+  })
+  nativeWindow = createdNativeWindow
+
+  createdNativeWindow.webContents.on('render-process-gone', (_event, details) => {
+    if (nativeWindow === createdNativeWindow) {
+      scheduleNativeWindowRecovery(details?.reason || 'render-process-gone', createdNativeWindow)
+    }
+  })
+
+  createdNativeWindow.once('closed', () => {
+    if (nativeWindow === createdNativeWindow) {
+      scheduleNativeWindowRecovery('window-closed')
+    }
+  })
+
+  createdNativeWindow.loadURL('about:blank').catch(error => {
+    rememberLog(`[native-window] hidden renderer failed to load: ${error?.message || error}`)
   })
 }
 
@@ -17509,6 +17577,8 @@ app.on('before-quit', event => {
   if (heldQuitForActiveWork(event)) {
     return
   }
+
+  nativeWindowQuitRequested = true
 
   // A detached remote updater can outlive this Electron process. Do not tear
   // down its SSH observer/restore transaction at the generic SSH shutdown
