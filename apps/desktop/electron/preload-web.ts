@@ -6,10 +6,17 @@
  * HTTP/WebSocket-server logic in this renderer-side module.
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse
+} from 'node:http'
+import { request as httpsRequest } from 'node:https'
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Duplex } from 'node:stream'
 
@@ -17,6 +24,7 @@ const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 13043
 const DEFAULT_MAX_BODY_BYTES = 1 * 1024 * 1024
 const WEBSOCKET_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+const GATEWAY_WEBSOCKET_PATH = '/api/ws'
 
 // These are existing Electron event channels sent to the hidden renderer by
 // main-web.ts. The web server subscribes to them here and republishes them to
@@ -92,10 +100,133 @@ interface EventSocket {
   closed: boolean
 }
 
+interface GatewayWebsocketScope {
+  connectionId?: string
+  profile?: string
+}
+
 function normalizePath(path: string): string {
   const trimmed = path.trim().replace(/\/+$/, '')
 
   return `/${trimmed.replace(/^\/+/, '') || 'web-api'}`
+}
+
+function requestOrigin(request: IncomingMessage): string | null {
+  const host = request.headers.host
+
+  if (!host) {
+    return null
+  }
+
+  const forwardedProto = request.headers['x-forwarded-proto']
+  const protocol =
+    typeof forwardedProto === 'string' && forwardedProto.trim()
+      ? forwardedProto.split(',')[0].trim()
+      : 'http'
+
+  return `${protocol}://${host}`
+}
+
+function browserGatewayWebsocketUrl(request: IncomingMessage, scope: GatewayWebsocketScope): string | null {
+  const origin = requestOrigin(request)
+
+  if (!origin) {
+    return null
+  }
+
+  const url = new URL(`${origin}${GATEWAY_WEBSOCKET_PATH}`)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+
+  if (scope.connectionId) {
+    url.searchParams.set('connectionId', scope.connectionId)
+  }
+
+  if (scope.profile) {
+    url.searchParams.set('profile', scope.profile)
+  }
+
+  return url.toString()
+}
+
+function gatewayScope(channel: string, args: unknown[]): GatewayWebsocketScope | null {
+  if (channel === 'hermes:connection' || channel === 'hermes:gateway:ws-url') {
+    const profile = typeof args[0] === 'string' && args[0].trim() ? args[0].trim() : undefined
+
+    return profile ? { profile } : {}
+  }
+
+  if (channel === 'hermes:connection:for' || channel === 'hermes:gateway:ws-url-for') {
+    const payload = args[0]
+
+    if (!payload || typeof payload !== 'object') {
+      return {}
+    }
+
+    const value = payload as { connectionId?: unknown; profile?: unknown }
+    const connectionId = typeof value.connectionId === 'string' && value.connectionId.trim() ? value.connectionId.trim() : undefined
+    const profile = typeof value.profile === 'string' && value.profile.trim() ? value.profile.trim() : undefined
+
+    return { ...(connectionId ? { connectionId } : {}), ...(profile ? { profile } : {}) }
+  }
+
+  return null
+}
+
+function sanitizeGatewayResult(
+  channel: string,
+  args: unknown[],
+  result: unknown,
+  request: IncomingMessage
+): unknown {
+  const scope = gatewayScope(channel, args)
+
+  if (!scope) {
+    return result
+  }
+
+  const browserUrl = browserGatewayWebsocketUrl(request, scope)
+
+  if (!browserUrl) {
+    return result
+  }
+
+  if (typeof result === 'string') {
+    return browserUrl
+  }
+
+  if (!result || typeof result !== 'object') {
+    return result
+  }
+
+  const rewritten = { ...(result as Record<string, unknown>) }
+
+  if ('baseUrl' in rewritten) {
+    rewritten.baseUrl = requestOrigin(request)
+  }
+
+  if ('wsUrl' in rewritten) {
+    rewritten.wsUrl = browserUrl
+  }
+
+  if ('token' in rewritten) {
+    rewritten.token = ''
+  }
+
+  return rewritten
+}
+
+function gatewayWsUrlFromResult(result: unknown): string | null {
+  if (typeof result === 'string') {
+    return result
+  }
+
+  if (!result || typeof result !== 'object') {
+    return null
+  }
+
+  const value = result as { ok?: unknown; wsUrl?: unknown }
+
+  return value.ok === true && typeof value.wsUrl === 'string' ? value.wsUrl : null
 }
 
 function jsonResponse(response: ServerResponse, status: number, payload: unknown, origin?: string): void {
@@ -269,9 +400,10 @@ async function serveStatic(
   response.statusCode = 200
   response.setHeader('Content-Type', CONTENT_TYPES[extname(filePath).toLowerCase()] || 'application/octet-stream')
   response.setHeader('Content-Length', body?.length ?? fileStat.size)
+  const browserBridgeFile = browserBridgePath ? staticFilePath(staticRoot, browserBridgePath) : null
   response.setHeader(
     'Cache-Control',
-    filePath.endsWith('index.html') ? 'no-cache' : 'public, max-age=31536000, immutable'
+    filePath.endsWith('index.html') || filePath === browserBridgeFile ? 'no-cache' : 'public, max-age=31536000, immutable'
   )
 
   if (request.method === 'HEAD') {
@@ -439,6 +571,7 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
   const staticRoot = options.staticRoot ? resolve(options.staticRoot) : null
   const browserBridgePath = options.browserBridgePath
   const clients = new Set<EventSocket>()
+  const gatewayRelays = new Set<() => void>()
 
   function allowedOrigin(request: IncomingMessage): string | undefined {
     const origin = request.headers.origin
@@ -518,7 +651,12 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
       const payload = validateRequest(await readBody(request, maxBodyBytes))
       const kind = url.pathname === invokePath ? 'invoke' : 'send'
       const context: PreloadBridgeContext = { kind, channel: payload.channel, args: payload.args, request }
-      const result = await options[kind](payload.channel, payload.args, context)
+      let result = await options[kind](payload.channel, payload.args, context)
+
+      if (kind === 'invoke') {
+        result = sanitizeGatewayResult(payload.channel, payload.args, result, request)
+      }
+
       jsonResponse(response, 200, { ok: true, result }, responseOrigin)
     } catch (error) {
       const statusCode = typeof error === 'object' && error && 'statusCode' in error ? Number(error.statusCode) : 500
@@ -534,6 +672,98 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
     }
   }
 
+  async function relayGatewayUpgrade(request: IncomingMessage, socket: Duplex, head: Uint8Array, url: URL): Promise<void> {
+    const connectionId = url.searchParams.get('connectionId')?.trim() || undefined
+    const profile = url.searchParams.get('profile')?.trim() || undefined
+    const channel = connectionId ? 'hermes:gateway:ws-url-for' : 'hermes:gateway:ws-url'
+    const args = connectionId ? [{ connectionId, profile }] : [profile]
+    const context: PreloadBridgeContext = { kind: 'invoke', channel, args, request }
+    const result = await options.invoke(channel, args, context)
+    const targetUrl = gatewayWsUrlFromResult(result)
+
+    if (!targetUrl) {
+      throw new Error('Gateway did not provide a WebSocket URL')
+    }
+
+    const target = new URL(targetUrl)
+
+    if (target.protocol !== 'ws:' && target.protocol !== 'wss:') {
+      throw new Error('Gateway returned an invalid WebSocket URL')
+    }
+
+    const requestOptions = {
+      hostname: target.hostname,
+      ...(target.port ? { port: target.port } : {}),
+      path: `${target.pathname || '/'}${target.search}`,
+      method: 'GET',
+      headers: {
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Version': '13',
+        // Terminate the browser handshake here and use a separate key upstream.
+        'Sec-WebSocket-Key': randomBytes(16).toString('base64')
+      }
+    }
+    const requestFn = target.protocol === 'wss:' ? httpsRequest : httpRequest
+    const upstreamRequest = requestFn(requestOptions)
+
+    upstreamRequest.once(
+      'upgrade',
+      (upstreamResponse: IncomingMessage, upstreamSocket: Duplex, upstreamHead: Uint8Array) => {
+      const responseLines = [
+        'HTTP/1.1 101 Switching Protocols',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Accept: ${websocketAccept(request.headers['sec-websocket-key'] as string)}`
+      ]
+      const protocol = upstreamResponse.headers['sec-websocket-protocol']
+
+      if (typeof protocol === 'string' && protocol) {
+        responseLines.push(`Sec-WebSocket-Protocol: ${protocol}`)
+      }
+
+      socket.write(`${responseLines.join('\r\n')}\r\n\r\n`)
+
+      let closed = false
+      const closeRelay = () => {
+        if (closed) {
+          return
+        }
+
+        closed = true
+        gatewayRelays.delete(closeRelay)
+        socket.destroy()
+        upstreamSocket.destroy()
+      }
+
+      gatewayRelays.add(closeRelay)
+      socket.once('close', closeRelay)
+      socket.once('error', closeRelay)
+      upstreamSocket.once('close', closeRelay)
+      upstreamSocket.once('error', closeRelay)
+
+      if (upstreamHead.length) {
+        socket.write(upstreamHead)
+      }
+
+      if (head.length) {
+        upstreamSocket.write(head)
+      }
+
+        socket.pipe(upstreamSocket)
+        upstreamSocket.pipe(socket)
+      }
+    )
+    upstreamRequest.once('response', (response: IncomingMessage) => {
+      response.resume()
+      const status = response.statusCode || 502
+      const message = (response.statusMessage || 'Bad Gateway').replace(/[\r\n]/g, ' ')
+      socket.end(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\n\r\n`)
+    })
+    upstreamRequest.once('error', () => socket.destroy())
+    upstreamRequest.end()
+  }
+
   const server = createServer((request, response) => {
     void handleRequest(request, response)
   })
@@ -542,13 +772,19 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
     const url = new URL(request.url || '/', `http://${request.headers.host || `${host}:${options.port || 0}`}`)
 
     if (
-      url.pathname !== eventsPath ||
+      (url.pathname !== eventsPath && url.pathname !== GATEWAY_WEBSOCKET_PATH) ||
       request.headers.upgrade?.toLowerCase() !== 'websocket' ||
       request.headers['sec-websocket-version'] !== '13' ||
       typeof request.headers['sec-websocket-key'] !== 'string' ||
       (request.headers.origin && !allowedOrigin(request))
     ) {
       socket.destroy()
+
+      return
+    }
+
+    if (url.pathname === GATEWAY_WEBSOCKET_PATH) {
+      void relayGatewayUpgrade(request, socket, head, url).catch(() => socket.destroy())
 
       return
     }
@@ -610,7 +846,12 @@ export function createPreloadBridge(options: PreloadBridgeOptions): PreloadBridg
           closeSocket(client)
         }
 
+        for (const closeRelay of gatewayRelays) {
+          closeRelay()
+        }
+
         clients.clear()
+        gatewayRelays.clear()
 
         if (!server.listening) {
           resolve()

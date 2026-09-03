@@ -1,7 +1,7 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { request as httpRequest } from 'node:http'
+import { createServer, request as httpRequest } from 'node:http'
 import { connect as netConnect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest'
 
 import { createPreloadBridge, startPreloadWebServer } from './preload-web'
 
-function postJson(port: number, path: string, payload: unknown, origin: string) {
+function postJson(port: number, path: string, payload: unknown, origin: string, extraHeaders: Record<string, string> = {}) {
   return new Promise<{ status: number; body: any }>((resolve, reject) => {
     const request = httpRequest(
       {
@@ -20,7 +20,8 @@ function postJson(port: number, path: string, payload: unknown, origin: string) 
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Origin: origin
+          Origin: origin,
+          ...extraHeaders
         }
       },
       response => {
@@ -256,6 +257,119 @@ describe('preload bridge', () => {
     } finally {
       socket.destroy()
       await bridge.stop()
+    }
+  })
+
+  it('keeps gateway credentials server-side and relays the browser websocket', async () => {
+    const upstream = createServer()
+
+    upstream.on('upgrade', (request, socket) => {
+      const key = request.headers['sec-websocket-key'] as string
+      const accept = createHash('sha1')
+        .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+        .digest('base64')
+
+      socket.write(
+        [
+          'HTTP/1.1 101 Switching Protocols',
+          'Upgrade: websocket',
+          'Connection: Upgrade',
+          `Sec-WebSocket-Accept: ${accept}`,
+          '',
+          ''
+        ].join('\r\n')
+      )
+      socket.once('data', () => socket.end(Buffer.from([0x81, 0x02, 0x6f, 0x6b])))
+    })
+    upstream.listen(0, '127.0.0.1')
+    await once(upstream, 'listening')
+
+    const upstreamAddress = upstream.address()
+    if (!upstreamAddress || typeof upstreamAddress === 'string') {
+      throw new Error('Upstream test server did not receive a TCP address')
+    }
+
+    const upstreamWsUrl = `ws://127.0.0.1:${upstreamAddress.port}/api/ws?token=server-secret`
+    const bridge = createPreloadBridge({
+      host: '127.0.0.1',
+      port: 0,
+      invoke: async channel => {
+        if (channel === 'hermes:connection:for') {
+          return {
+            baseUrl: `http://127.0.0.1:${upstreamAddress.port}`,
+            connectionId: 'local',
+            token: 'server-secret',
+            wsUrl: upstreamWsUrl
+          }
+        }
+
+        if (channel === 'hermes:gateway:ws-url-for') {
+          return { ok: true, wsUrl: upstreamWsUrl }
+        }
+
+        throw new Error(`Unexpected channel: ${channel}`)
+      },
+      send: async () => undefined
+    })
+    const address = await bridge.start()
+    const origin = `http://127.0.0.1:${address.port}`
+    let browserSocket: ReturnType<typeof netConnect> | undefined
+
+    try {
+      const descriptor = await postJson(
+        address.port,
+        '/web-api/invoke',
+        { channel: 'hermes:connection:for', args: [{ connectionId: 'local', profile: 'work' }] },
+        origin
+      )
+
+      expect(descriptor.body).toEqual({
+        ok: true,
+        result: {
+          baseUrl: origin,
+          connectionId: 'local',
+          token: '',
+          wsUrl: `ws://${address.host}:${address.port}/api/ws?connectionId=local&profile=work`
+        }
+      })
+      expect(JSON.stringify(descriptor.body)).not.toContain('server-secret')
+
+      const httpsDescriptor = await postJson(
+        address.port,
+        '/web-api/invoke',
+        { channel: 'hermes:connection:for', args: [{ connectionId: 'local', profile: 'work' }] },
+        `https://${address.host}:${address.port}`,
+        { 'X-Forwarded-Proto': 'https' }
+      )
+      expect(httpsDescriptor.body.result.wsUrl).toBe(`wss://${address.host}:${address.port}/api/ws?connectionId=local&profile=work`)
+
+      browserSocket = netConnect(address.port, address.host)
+      await once(browserSocket, 'connect')
+      const key = randomBytes(16).toString('base64')
+      browserSocket.write(
+        [
+          'GET /api/ws?connectionId=local&profile=work HTTP/1.1',
+          `Host: ${address.host}:${address.port}`,
+          `Origin: ${origin}`,
+          'Upgrade: websocket',
+          'Connection: Upgrade',
+          'Sec-WebSocket-Version: 13',
+          `Sec-WebSocket-Key: ${key}`,
+          '',
+          ''
+        ].join('\r\n')
+      )
+
+      const [handshakeChunk] = await once(browserSocket, 'data')
+      expect(String(handshakeChunk)).toContain('101 Switching Protocols')
+
+      browserSocket.write(Buffer.from([0x81, 0x81, 0x01, 0x02, 0x03, 0x04, 0x79]))
+      const [frameChunk] = await once(browserSocket, 'data')
+      expect(Buffer.from(frameChunk as Buffer)).toEqual(Buffer.from([0x81, 0x02, 0x6f, 0x6b]))
+    } finally {
+      browserSocket?.destroy()
+      await bridge.stop()
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
     }
   })
 })
