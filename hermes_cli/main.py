@@ -8852,7 +8852,7 @@ def cmd_desktop_web(args: argparse.Namespace):
 
     if source_mode:
         print("→ Launching Hermes Desktop from source build...")
-        launch_command = _desktop_launch_command([npm, "exec", "--", "electron", "."], env)
+        launch_command = _desktop_launch_command([npm, "exec", "--", "electron", "--no-sandbox", "."], env)
         launch_result = _run_desktop_npm_command(
             launch_command,
             desktop_dir=desktop_dir,
