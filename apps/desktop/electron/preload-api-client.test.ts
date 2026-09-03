@@ -13,6 +13,7 @@ afterEach(() => {
   vi.restoreAllMocks()
   Reflect.deleteProperty(globalThis, 'window')
   Reflect.deleteProperty(globalThis, 'location')
+  Reflect.deleteProperty(globalThis, '__HERMES_WEB_API_BASE__')
 })
 
 test('exposes hermesDesktop and routes getConnection through web-api invoke', async () => {
@@ -22,7 +23,11 @@ test('exposes hermesDesktop and routes getConnection through web-api invoke', as
   })
   Object.defineProperty(globalThis, 'location', {
     configurable: true,
-    value: { origin: 'http://127.0.0.1:13043' }
+    value: { origin: 'http://browser-origin.invalid' }
+  })
+  Object.defineProperty(globalThis, '__HERMES_WEB_API_BASE__', {
+    configurable: true,
+    value: 'http://127.0.0.1:13043'
   })
 
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -32,16 +37,28 @@ test('exposes hermesDesktop and routes getConnection through web-api invoke', as
     assert.deepEqual(init?.headers, { 'Content-Type': 'application/json' })
 
     const request = JSON.parse(String(init?.body))
+
     if (request.channel === 'hermes:connection') {
       assert.deepEqual(request, {
         channel: 'hermes:connection',
         args: ['work']
       })
 
-      return new Response(JSON.stringify({ ok: true, result: { profile: 'work' } }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      })
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          result: {
+            profile: 'work',
+            baseUrl: 'https://remote-gateway.example/api',
+            wsUrl: 'wss://remote-gateway.example/api/ws?ticket=test-ticket',
+            token: 'server-only-token'
+          }
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      )
     }
 
     assert.deepEqual(request, {
@@ -61,7 +78,12 @@ test('exposes hermesDesktop and routes getConnection through web-api invoke', as
 
   const desktop = (globalThis.window as WebDesktopWindow).hermesDesktop
   assert.ok(desktop)
-  assert.deepEqual(await desktop!.getConnection('work'), { profile: 'work' })
+  assert.deepEqual(await desktop!.getConnection('work'), {
+    profile: 'work',
+    baseUrl: 'http://127.0.0.1:13043/api',
+    wsUrl: 'ws://127.0.0.1:13043/api/ws?profile=work',
+    token: ''
+  })
   assert.deepEqual(await desktop!.api<{ profile: string }>({ path: '/api/config' }), { profile: 'work' })
   assert.equal(fetchMock.mock.calls.length, 2)
 })

@@ -14,5 +14,5 @@ if [ -d "$ASSETS_DIR" ]; then
     echo "Deleted JS files from /dist/assets"
 fi
 
-HERMES_HOME=~/.hermes-2 taskset --cpu-list 0,1 ./venv/bin/hermes desktop-web --source --force-build --build-only  --host 0.0.0.0 --port 13043
-HERMES_HOME=~/.hermes-2 ./venv/bin/hermes desktop-web --skip-build --host 0.0.0.0 --port 13043
+HERMES_HOME=~/.hermes-2 taskset --cpu-list 0,1 ./venv/bin/hermes desktop-web --source --force-build --build-only --host 0.0.0.0 --port 13043
+HERMES_HOME=~/.hermes-2 ./venv/bin/hermes desktop-web --source --skip-build --host 0.0.0.0 --port 13043

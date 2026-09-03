@@ -46,6 +46,10 @@ interface WebClientWindow extends Window {
 
 const DEFAULT_RECONNECT_DELAY_MS = 250
 const MAX_RECONNECT_DELAY_MS = 5_000
+// The browser-facing gateway endpoint. Change this one path if the web bridge
+// is mounted below a different gateway namespace; the base and WebSocket URLs
+// below derive from it.
+const WEB_GATEWAY_BASE_PATH = '/api'
 
 function apiBaseUrl(): string {
   const configured = (globalThis as unknown as WebClientWindow).__HERMES_WEB_API_BASE__
@@ -65,6 +69,86 @@ function apiUrl(path: string): string {
   const base = apiBaseUrl()
 
   return base ? `${base}${path}` : path
+}
+
+interface GatewayWebsocketScope {
+  connectionId?: null | string
+  profile?: null | string
+}
+
+function browserGatewayBaseUrl(): URL | null {
+  if (typeof location === 'undefined') {
+    return null
+  }
+
+  return new URL(WEB_GATEWAY_BASE_PATH, apiBaseUrl() || location.origin)
+}
+
+function browserGatewayWebsocketUrl(scope: GatewayWebsocketScope): string | null {
+  const url = browserGatewayBaseUrl()
+
+  if (!url) {
+    return null
+  }
+
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/ws`
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+
+  if (scope.connectionId) {
+    url.searchParams.set('connectionId', scope.connectionId)
+  }
+
+  if (scope.profile) {
+    url.searchParams.set('profile', scope.profile)
+  }
+
+  return url.toString()
+}
+
+function rewriteGatewayWebsocketUrl(value: unknown, scope: GatewayWebsocketScope): unknown {
+  if (typeof value !== 'string') {
+    return value
+  }
+
+  try {
+    const target = new URL(value)
+
+    if (target.protocol !== 'ws:' && target.protocol !== 'wss:') {
+      return value
+    }
+
+    return browserGatewayWebsocketUrl(scope) || value
+  } catch {
+    return value
+  }
+}
+
+function rewriteGatewayResult(value: unknown, scope: GatewayWebsocketScope): unknown {
+  if (typeof value === 'string') {
+    return rewriteGatewayWebsocketUrl(value, scope)
+  }
+
+  if (!value || typeof value !== 'object') {
+    return value
+  }
+
+  const record = value as { baseUrl?: unknown; token?: unknown; wsUrl?: unknown }
+  const rewritten: Record<string, unknown> = { ...(value as Record<string, unknown>) }
+  const baseUrl = browserGatewayBaseUrl()
+
+  if (typeof record.baseUrl === 'string' && baseUrl) {
+    rewritten.baseUrl = baseUrl.toString().replace(/\/$/, '')
+  }
+
+  if (typeof record.wsUrl === 'string') {
+    rewritten.wsUrl = rewriteGatewayWebsocketUrl(record.wsUrl, scope)
+  }
+
+  if ('token' in record) {
+    rewritten.token = ''
+  }
+
+  return rewritten
 }
 
 function socketUrl(): string {
@@ -291,16 +375,20 @@ const hermesDesktop = {
   // Browser clients do not have Electron's native glass/translucency support.
   glassSupported: false,
   translucencySupported: false,
-  getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
+  getConnection: (profile: null | string | undefined) =>
+    ipcRenderer.invoke('hermes:connection', profile).then(result => rewriteGatewayResult(result, { profile })),
   // Registry-scoped backend resolution: { connectionId, profile } → descriptor.
-  getConnectionFor: payload => ipcRenderer.invoke('hermes:connection:for', payload),
+  getConnectionFor: (payload: { connectionId?: null | string; profile?: null | string }) =>
+    ipcRenderer.invoke('hermes:connection:for', payload).then(result => rewriteGatewayResult(result, payload)),
   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
-  touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
-  getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  touchBackend: (profile: null | string | undefined) => ipcRenderer.invoke('hermes:backend:touch', profile),
+  getGatewayWsUrl: (profile: null | string | undefined) =>
+    ipcRenderer.invoke('hermes:gateway:ws-url', profile).then(result => rewriteGatewayResult(result, { profile })),
   // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
   // getGatewayWsUrl, minted against that connection's backend.
-  getGatewayWsUrlFor: payload => ipcRenderer.invoke('hermes:gateway:ws-url-for', payload),
+  getGatewayWsUrlFor: (payload: { connectionId?: null | string; profile?: null | string }) =>
+    ipcRenderer.invoke('hermes:gateway:ws-url-for', payload).then(result => rewriteGatewayResult(result, payload)),
   // Union agent roster across every registered connection.
   getAgentRoster: () => ipcRenderer.invoke('hermes:agents:roster'),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
