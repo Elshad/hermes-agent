@@ -375,6 +375,9 @@ const hermesDesktop = {
   // Browser clients do not have Electron's native glass/translucency support.
   glassSupported: false,
   translucencySupported: false,
+  // The browser client has no synchronous Electron launch-flag bridge. Local
+  // model surfaces remain disabled rather than guessing the host process flags.
+  localModelsEnabled: false,
   getConnection: (profile: null | string | undefined) =>
     ipcRenderer.invoke('hermes:connection', profile).then(result => rewriteGatewayResult(result, { profile })),
   // Registry-scoped backend resolution: { connectionId, profile } → descriptor.
@@ -383,6 +386,9 @@ const hermesDesktop = {
   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: (profile: null | string | undefined) => ipcRenderer.invoke('hermes:backend:touch', profile),
+  getPoolLimits: () => ipcRenderer.invoke('hermes:pool-limits:get'),
+  setPoolLimits: (limits: { maxBackends?: number; idleMs?: number }) =>
+    ipcRenderer.invoke('hermes:pool-limits:set', limits),
   getGatewayWsUrl: (profile: null | string | undefined) =>
     ipcRenderer.invoke('hermes:gateway:ws-url', profile).then(result => rewriteGatewayResult(result, { profile })),
   // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
@@ -615,7 +621,8 @@ const hermesDesktop = {
 
     return () => ipcRenderer.removeListener('hermes:context-menu-spellcheck', listener)
   },
-  saveImageBuffer: (data, ext) => ipcRenderer.invoke('hermes:saveImageBuffer', { data, ext }),
+  saveImageBuffer: (data, ext, name) => ipcRenderer.invoke('hermes:saveImageBuffer', { data, ext, name }),
+  capturePreview: payload => ipcRenderer.invoke('hermes:capturePreview', payload),
   saveClipboardImage: () => ipcRenderer.invoke('hermes:saveClipboardImage'),
   getPathForFile: file => {
     try {
@@ -716,6 +723,7 @@ const hermesDesktop = {
     }
   },
   terminal: {
+    attach: id => ipcRenderer.invoke('hermes:terminal:attach', id),
     cwd: id => ipcRenderer.invoke('hermes:terminal:cwd', id),
     dispose: id => ipcRenderer.invoke('hermes:terminal:dispose', id),
     resize: (id, size) => ipcRenderer.invoke('hermes:terminal:resize', id, size),
@@ -840,6 +848,7 @@ const hermesDesktop = {
   // reload mid-bootstrap.
   getBootstrapState: () => ipcRenderer.invoke('hermes:bootstrap:get'),
   continueBootstrapLocal: () => ipcRenderer.invoke('hermes:bootstrap:continue-local'),
+  recycleBackend: (profile?: null | string) => ipcRenderer.invoke('hermes:backend:recycle', profile),
   resetBootstrap: () => ipcRenderer.invoke('hermes:bootstrap:reset'),
   repairBootstrap: () => ipcRenderer.invoke('hermes:bootstrap:repair'),
   cancelBootstrap: () => ipcRenderer.invoke('hermes:bootstrap:cancel'),
@@ -850,6 +859,7 @@ const hermesDesktop = {
     return () => ipcRenderer.removeListener('hermes:bootstrap:event', listener)
   },
   getVersion: () => ipcRenderer.invoke('hermes:version'),
+  relaunchApp: () => ipcRenderer.invoke('hermes:app:relaunch'),
   getRemoteDisplayReason: () => ipcRenderer.invoke('hermes:get-remote-display-reason'),
   uninstall: {
     summary: () => ipcRenderer.invoke('hermes:uninstall:summary'),
