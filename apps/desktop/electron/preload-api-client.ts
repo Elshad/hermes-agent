@@ -1,3 +1,5 @@
+import { oauthLoginConnectionConfig as browserOauthLoginConnectionConfig } from './preload-client-helper'
+
 /**
  * Browser-side ipcRenderer compatibility layer for Desktop-Web.
  *
@@ -577,7 +579,12 @@ const hermesDesktop = {
   sshConfigHosts: () => ipcRenderer.invoke('hermes:ssh-config:hosts'),
   sshResolveHost: host => ipcRenderer.invoke('hermes:ssh-config:resolve', host),
   probeConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:probe', remoteUrl),
-  oauthLoginConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-login', remoteUrl),
+  // Desktop-Web must authenticate through the browser-visible proxy. Invoking
+  // the native IPC handler here would open a login window on the server host,
+  // not in the user's browser. Keep the IPC implementation in preload.ts for
+  // native Electron; this bridge intentionally uses the browser helper.
+  // ipcRenderer.invoke('hermes:connection-config:oauth-login', remoteUrl),
+  oauthLoginConnectionConfig: (remoteUrl: string) => browserOauthLoginConnectionConfig(remoteUrl),
   oauthLogoutConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-logout', remoteUrl),
   // Hermes Cloud: one portal login powers discovery + silent per-agent sign-in
   // (cloud-auto-discovery Phase 3).
